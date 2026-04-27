@@ -58,6 +58,9 @@ CONFIG = {
     "netflow_min_exchanges": 4,
     "rules": {
         "r1_oi_vs_price_ratio": 3.0,
+        "r1_oi_growth_min_pct": 0.033,         # OI 增长率不低于 3.3%
+        "r1_oi_growth_min_usd": 50_000,         # OI 绝对增长不低于 $50k
+        "r1_oi_growth_zero_price_usd": 150_000, # 价格不变时 OI 增长 >= $150k
         "r2_negative_funding_periods": 3,
         "r3_funding_rate_threshold": -0.0005,
         "r4_netflow_threshold_usd": 500_000,
@@ -71,6 +74,8 @@ CONFIG = {
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TG_SUMMARY_TOKEN = os.getenv("TELEGRAM_SUMMARY_BOT_TOKEN", "")
+TG_SUMMARY_CHAT_ID = os.getenv("TELEGRAM_SUMMARY_CHAT_ID", "")
 
 # ============ Logging ============
 logger.remove()
@@ -90,6 +95,9 @@ netflow_history: dict[str, dict[str, deque]] = defaultdict(
 )
 last_levels: dict[str, str] = {}
 round_count = 0
+# 6h summary accumulator: list of alert records per summary window
+summary_alerts: list[dict] = []
+last_summary_hour: int = -1
 
 
 # ====================================================================
@@ -695,7 +703,7 @@ async def fetch_symbol_data(base, bf: BinanceFutures, okx: OkxSwap, bn_spot: Bin
 #  Rule Engine
 # ====================================================================
 def rule_r1(d):
-    """OI 异常增长: oi_growth >= 3 * |price_growth|"""
+    """OI 异常增长: oi_growth >= 3 * |price_growth|, with minimum thresholds."""
     # Aggregate OI
     oi_now_parts = [v for v in [d["bn_oi_now"], d["ok_oi_now"]] if v is not None]
     oi_1h_parts = [v for v in [d["bn_oi_1h"], d["ok_oi_1h"]] if v is not None]
@@ -705,23 +713,44 @@ def rule_r1(d):
     oi_1h = sum(oi_1h_parts)
     if oi_1h <= 0 or d["price_1h"] is None or d["price_1h"] <= 0:
         return False, "", {}
+
     oi_growth = (oi_now - oi_1h) / oi_1h
+    oi_growth_usd = oi_now - oi_1h
     price_growth = (d["price_now"] - d["price_1h"]) / d["price_1h"]
+
     if oi_growth <= 0:
         return False, "", {}
-    ratio = CONFIG["rules"]["r1_oi_vs_price_ratio"]
+
+    rules = CONFIG["rules"]
+    ratio = rules["r1_oi_vs_price_ratio"]
+    min_pct = rules["r1_oi_growth_min_pct"]
+    min_usd = rules["r1_oi_growth_min_usd"]
+    zero_price_usd = rules["r1_oi_growth_zero_price_usd"]
+
+    triggered = False
+    reason = ""
+
     if abs(price_growth) == 0:
-        triggered = True
-        reason = f"OI 1h +{oi_growth:.1%}, 价格不变 (∞×)"
+        # 价格不变: 只看 OI 绝对增长是否 >= $150k
+        if oi_growth_usd >= zero_price_usd:
+            triggered = True
+            reason = f"OI 1h +{oi_growth:.1%} (+${oi_growth_usd:,.0f}), 价格不变 (∞×)"
     elif oi_growth >= ratio * abs(price_growth):
-        mult = oi_growth / abs(price_growth)
-        reason = f"OI 1h +{oi_growth:.1%}, 价格 {price_growth:+.1%} ({mult:.1f}×)"
-        triggered = True
-    else:
+        # 原比率逻辑 + 新增门槛: OI 增长率 >= 3.3% 且 OI 绝对增长 >= $50k
+        if oi_growth >= min_pct and oi_growth_usd >= min_usd:
+            mult = oi_growth / abs(price_growth)
+            reason = (
+                f"OI 1h +{oi_growth:.1%} (+${oi_growth_usd:,.0f}), "
+                f"价格 {price_growth:+.1%} ({mult:.1f}×)"
+            )
+            triggered = True
+
+    if not triggered:
         return False, "", {}
+
     extra = {
         "oi_now": oi_now, "oi_1h": oi_1h, "oi_growth": oi_growth,
-        "price_growth": price_growth,
+        "oi_growth_usd": oi_growth_usd, "price_growth": price_growth,
         "bn_oi_now": d["bn_oi_now"], "ok_oi_now": d["ok_oi_now"],
         "bn_oi_1h": d["bn_oi_1h"], "ok_oi_1h": d["ok_oi_1h"],
     }
@@ -1022,6 +1051,12 @@ async def monitor_once(http, bf, okx_swap, spot_clients):
                     alerts_by_level[result["level"]].append((base, result, data, level_change))
                     log_alert_json(base, result, data)
                     last_levels[base] = result["level"]
+                    # Accumulate for 6h summary
+                    summary_alerts.append({
+                        "symbol": base,
+                        "level": result["level"],
+                        "hits": result["hits"],
+                    })
             except Exception as e:
                 logger.exception(f"Processing {base} failed: {e}")
 
@@ -1055,8 +1090,119 @@ async def monitor_once(http, bf, okx_swap, spot_clients):
     alert_summary = " | ".join(parts) if parts else "无告警"
     ts3 = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts3}] 本轮结束 | 耗时 {elapsed:.0f}s | {alert_summary} | TG 推送 {total_alerts} 条")
-    print(f"[{ts3}] Sleep {CONFIG['loop_interval_seconds'] // 60} min...")
     logger.info(f"Round {round_count} done: {total_alerts} alerts, {elapsed:.1f}s")
+
+
+# ====================================================================
+#  Clock-aligned sleep (snap to 00/15/30/45 minute boundaries)
+# ====================================================================
+async def sleep_until_next_boundary():
+    """Sleep until the next 15-min clock boundary (xx:00, xx:15, xx:30, xx:45)."""
+    now = time.time()
+    interval = CONFIG["loop_interval_seconds"]
+    # Next boundary = ceiling of current time to interval
+    next_boundary = (int(now) // interval + 1) * interval
+    wait = next_boundary - now
+    if wait < 10:
+        # Already very close to boundary, skip to next one
+        wait += interval
+    ts = datetime.now().strftime("%H:%M:%S")
+    next_ts = datetime.fromtimestamp(next_boundary).strftime("%H:%M:%S")
+    print(f"[{ts}] Sleep until {next_ts} ({wait:.0f}s)...")
+    await asyncio.sleep(wait)
+
+
+# ====================================================================
+#  6-hour summary (push to secondary TG group)
+# ====================================================================
+async def send_tg_summary(message, http):
+    """Send summary to the secondary TG bot/group."""
+    token = TG_SUMMARY_TOKEN or TG_TOKEN
+    chat_id = TG_SUMMARY_CHAT_ID
+    if not token or not chat_id:
+        logger.warning("Summary TG credentials not configured, skip")
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message[:4000] + ("..." if len(message) > 4000 else ""),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    for attempt in range(3):
+        try:
+            r = await http.post(url, json=payload, timeout=10)
+            if r.status_code == 200:
+                return True
+            logger.warning(f"Summary TG push HTTP {r.status_code}")
+        except Exception as e:
+            logger.warning(f"Summary TG push error (attempt {attempt + 1}): {e}")
+        await asyncio.sleep(2 ** attempt)
+    logger.error("Summary TG push final failure")
+    return False
+
+
+async def maybe_send_summary(http):
+    """Check if we've crossed a 6h boundary, if so send summary."""
+    global last_summary_hour, summary_alerts
+    now = datetime.now(timezone.utc)
+    current_hour = now.hour
+    # 6h boundaries: 0, 6, 12, 18
+    summary_boundary = (current_hour // 6) * 6
+    if summary_boundary == last_summary_hour:
+        return  # Not time yet
+    if last_summary_hour == -1:
+        # First run, just initialize
+        last_summary_hour = summary_boundary
+        return
+
+    # Time to send summary
+    if not summary_alerts:
+        msg = (
+            f"📋 <b>6h 数据总结</b> ({last_summary_hour:02d}:00 ~ {summary_boundary:02d}:00 UTC)\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "本时段无告警触发。"
+        )
+    else:
+        # Count by level
+        level_counts = {"🔴": 0, "🟠": 0, "🟡": 0}
+        symbol_hits: dict[str, list[str]] = {}
+        for alert in summary_alerts:
+            lv = alert["level"]
+            level_counts[lv] = level_counts.get(lv, 0) + 1
+            sym = alert["symbol"]
+            if sym not in symbol_hits:
+                symbol_hits[sym] = []
+            for tag, _ in alert["hits"]:
+                if tag not in symbol_hits[sym]:
+                    symbol_hits[sym].append(tag)
+
+        # Top symbols by alert frequency
+        sym_freq = sorted(
+            [(sym, len([a for a in summary_alerts if a["symbol"] == sym]))
+             for sym in symbol_hits],
+            key=lambda x: -x[1]
+        )
+
+        lines = [
+            f"📋 <b>6h 数据总结</b> ({last_summary_hour:02d}:00 ~ {summary_boundary:02d}:00 UTC)",
+            "━━━━━━━━━━━━━━━━━",
+            f"📊 告警总数: {len(summary_alerts)} 条",
+            f"   🔴 {level_counts['🔴']} | 🟠 {level_counts['🟠']} | 🟡 {level_counts['🟡']}",
+            "",
+            "🏆 <b>高频触发币种 (Top 10)</b>",
+        ]
+        for sym, count in sym_freq[:10]:
+            rules = ", ".join(symbol_hits[sym])
+            lines.append(f"  • <b>{sym}</b> × {count} ({rules})")
+
+        lines.append("")
+        lines.append(f"<i>{now.strftime('%Y-%m-%d %H:%M UTC')}</i>")
+        msg = "\n".join(lines)
+
+    await send_tg_summary(msg, http)
+    last_summary_hour = summary_boundary
+    summary_alerts.clear()
 
 
 async def main():
@@ -1104,11 +1250,14 @@ async def main():
         while True:
             try:
                 await monitor_once(http, bf, okx_swap, spot_clients)
+                # Check if 6h summary is due
+                await maybe_send_summary(http)
             except Exception as e:
                 logger.exception(f"Round failed: {e}")
                 await asyncio.sleep(60)
                 continue
-            await asyncio.sleep(CONFIG["loop_interval_seconds"])
+            # Sleep until next 15-min clock boundary
+            await sleep_until_next_boundary()
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass
     finally:
