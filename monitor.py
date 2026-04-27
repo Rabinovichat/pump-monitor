@@ -1,0 +1,1126 @@
+"""
+加密货币拉升预警监控 v3
+========================
+
+识别"空头陷阱型拉升"信号:OI 异常增长、资金费率持续为负、现货净流入异常。
+8 家交易所聚合数据,Telegram 群实时推送。
+
+安装依赖:
+    pip install -r requirements.txt
+
+创建 Telegram Bot 并获取 Chat ID:
+    1. 在 TG 搜索 @BotFather,发送 /newbot
+    2. 按提示起名(如 "Pump Alert Bot"),拿到 Bot Token
+       格式: 1234567890:ABCdefGHI...
+    3. 建一个群(如 "拉升预警"),把 Bot 拉进群并设为管理员
+    4. 在群里随便发一条消息,浏览器访问:
+       https://api.telegram.org/bot<TOKEN>/getUpdates
+       找到 "chat":{"id":-100...} 那个负数就是 Chat ID
+    5. 复制 .env.example 为 .env,填入 Token 和 Chat ID:
+       TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHI...
+       TELEGRAM_CHAT_ID=-1001234567890
+
+启动:
+    python monitor.py
+
+四条规则:
+    R1 OI 异常增长     1h OI 增长率 >= 3x 价格涨幅           🟠 预警
+    R2 资金费率持续负   过去 24h(3期) 所有结算均 < 0          🟠 预警
+    R3 资金费率极值     当前资金费率 <= -0.05%                🔴 行动
+    R4 现货净流异常     8 家聚合 1h 净流入/出 >= $500,000     🟡 关注
+
+R4 预热期: 启动后需 45~60 分钟累积 4 个 15min 窗口后才开始触发。
+
+日志: logs/monitor.log (日级轮转,保留 30 天)
+    告警级别 WARNING(JSON 格式),可用 jq / pandas 查询。
+
+调阈值: 修改脚本内 CONFIG 字典的 rules 部分。
+"""
+
+import asyncio
+import json
+import os
+import sys
+import time
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+
+import httpx
+from dotenv import load_dotenv
+from loguru import logger
+
+load_dotenv()
+
+# ============ CONFIG ============
+CONFIG = {
+    "loop_interval_seconds": 900,
+    "netflow_window_count": 4,
+    "netflow_min_exchanges": 4,
+    "rules": {
+        "r1_oi_vs_price_ratio": 3.0,
+        "r2_negative_funding_periods": 3,
+        "r3_funding_rate_threshold": -0.0005,
+        "r4_netflow_threshold_usd": 500_000,
+    },
+    "excluded_symbols": {
+        "BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "TRX", "TON",
+        "DOT", "LINK", "MATIC", "LTC", "BCH", "UNI", "ATOM", "ETC", "FIL", "APT",
+        "USDC", "FDUSD", "DAI", "TUSD",
+    },
+}
+
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# ============ Logging ============
+logger.remove()
+logger.add(
+    sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"),
+    format="<green>{time:HH:mm:ss}</green> | <level>{level:8}</level> | {message}",
+)
+os.makedirs("logs", exist_ok=True)
+logger.add(
+    "logs/monitor.log", rotation="1 day", retention="30 days",
+    level="DEBUG", encoding="utf-8",
+)
+
+# ============ Global State ============
+netflow_history: dict[str, dict[str, deque]] = defaultdict(
+    lambda: defaultdict(lambda: deque(maxlen=CONFIG["netflow_window_count"]))
+)
+last_levels: dict[str, str] = {}
+round_count = 0
+
+
+# ====================================================================
+#  HTTP Helper
+# ====================================================================
+async def http_get(client, url, params=None, sem=None, retries=3):
+    _sem = sem or asyncio.Semaphore(9999)
+    async with _sem:
+        for attempt in range(retries):
+            try:
+                r = await client.get(url, params=params, timeout=15)
+                if r.status_code == 429:
+                    logger.warning(f"429 rate limit: {url}")
+                    await asyncio.sleep(60)
+                    continue
+                r.raise_for_status()
+                return r.json()
+            except Exception as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    raise
+
+
+# ====================================================================
+#  Binance Futures (OI + Funding Rate)
+# ====================================================================
+class BinanceFutures:
+    BASE = "https://fapi.binance.com"
+
+    def __init__(self, client):
+        self.client = client
+        self.sem = asyncio.Semaphore(8)
+
+    @staticmethod
+    def _sym(base):
+        return f"{base.upper()}USDT"
+
+    async def get_perp_symbols(self):
+        data = await http_get(self.client, f"{self.BASE}/fapi/v1/exchangeInfo")
+        return {
+            s["baseAsset"].upper()
+            for s in data["symbols"]
+            if s.get("status") == "TRADING"
+            and s.get("contractType") == "PERPETUAL"
+            and s.get("quoteAsset") == "USDT"
+        }
+
+    async def get_oi_history(self, base):
+        """(oi_now_usd, oi_1h_ago_usd) or (None, None)"""
+        try:
+            data = await http_get(
+                self.client,
+                f"{self.BASE}/futures/data/openInterestHist",
+                params={"symbol": self._sym(base), "period": "1h", "limit": 2},
+                sem=self.sem,
+            )
+            if data and len(data) >= 2:
+                # ascending by ts: [older, newer]
+                return float(data[-1]["sumOpenInterestValue"]), float(data[0]["sumOpenInterestValue"])
+        except Exception as e:
+            logger.warning(f"Binance OI hist {base}: {e}")
+        return None, None
+
+    async def get_funding_current(self, base):
+        try:
+            data = await http_get(
+                self.client,
+                f"{self.BASE}/fapi/v1/premiumIndex",
+                params={"symbol": self._sym(base)},
+                sem=self.sem,
+            )
+            return float(data["lastFundingRate"])
+        except Exception as e:
+            logger.warning(f"Binance FR current {base}: {e}")
+            return None
+
+    async def get_funding_history(self, base, limit=3):
+        try:
+            data = await http_get(
+                self.client,
+                f"{self.BASE}/fapi/v1/fundingRate",
+                params={"symbol": self._sym(base), "limit": limit},
+                sem=self.sem,
+            )
+            return [float(d["fundingRate"]) for d in data]
+        except Exception as e:
+            logger.warning(f"Binance FR hist {base}: {e}")
+            return []
+
+
+# ====================================================================
+#  OKX Swap (OI + Funding Rate)
+# ====================================================================
+class OkxSwap:
+    BASE = "https://www.okx.com"
+
+    def __init__(self, client):
+        self.client = client
+        self.sem = asyncio.Semaphore(5)
+
+    @staticmethod
+    def _inst(base):
+        return f"{base.upper()}-USDT-SWAP"
+
+    async def get_perp_symbols(self):
+        data = await http_get(
+            self.client,
+            f"{self.BASE}/api/v5/public/instruments",
+            params={"instType": "SWAP"},
+        )
+        symbols = set()
+        for inst in data.get("data", []):
+            if inst.get("settleCcy") == "USDT" and inst.get("state") == "live":
+                parts = inst["instId"].split("-")
+                if len(parts) >= 3:
+                    symbols.add(parts[0].upper())
+        return symbols
+
+    async def get_oi_history(self, base):
+        """(oi_now_usd, oi_1h_ago_usd) via rubik endpoint. Arrays: [ts, oi, oiCcy, oiUsd]"""
+        try:
+            data = await http_get(
+                self.client,
+                f"{self.BASE}/api/v5/rubik/stat/contracts/open-interest-history",
+                params={"instId": self._inst(base), "period": "1H", "limit": "2"},
+                sem=self.sem,
+            )
+            recs = data.get("data", [])
+            if len(recs) >= 2:
+                # recs[0] = newer, recs[1] = older; each is [ts, oi, oiCcy, oiUsd]
+                return float(recs[0][3]), float(recs[1][3])
+        except Exception as e:
+            logger.warning(f"OKX OI hist {base}: {e}")
+        return None, None
+
+    async def get_funding_current(self, base):
+        try:
+            data = await http_get(
+                self.client,
+                f"{self.BASE}/api/v5/public/funding-rate",
+                params={"instId": self._inst(base)},
+                sem=self.sem,
+            )
+            recs = data.get("data", [])
+            if recs:
+                return float(recs[0]["fundingRate"])
+        except Exception as e:
+            logger.warning(f"OKX FR current {base}: {e}")
+        return None
+
+    async def get_funding_history(self, base, limit=3):
+        try:
+            data = await http_get(
+                self.client,
+                f"{self.BASE}/api/v5/public/funding-rate-history",
+                params={"instId": self._inst(base), "limit": str(limit)},
+                sem=self.sem,
+            )
+            return [float(d["fundingRate"]) for d in data.get("data", [])]
+        except Exception as e:
+            logger.warning(f"OKX FR hist {base}: {e}")
+            return []
+
+
+# ====================================================================
+#  Spot Exchanges — Base
+# ====================================================================
+class BaseSpotExchange:
+    name: str = ""
+    _spot_bases: set
+    _sem: asyncio.Semaphore
+
+    def __init__(self, client):
+        self.client = client
+        self._spot_bases = set()
+        self._sem = asyncio.Semaphore(5)
+
+    async def load_spot_symbols(self):
+        raise NotImplementedError
+
+    def has_symbol(self, base):
+        return base.upper() in self._spot_bases
+
+    def format_symbol(self, base):
+        raise NotImplementedError
+
+    async def get_15min_netflow_usd(self, base):
+        raise NotImplementedError
+
+
+class TradesSpotExchange(BaseSpotExchange):
+    """Base for Tier-B exchanges (trades → netflow)."""
+
+    async def _fetch_raw_trades(self, base):
+        """Return list of dicts: {ts_ms, price, qty, side} ('buy'/'sell')."""
+        raise NotImplementedError
+
+    async def get_15min_netflow_usd(self, base):
+        trades = await self._fetch_raw_trades(base)
+        now_ms = time.time() * 1000
+        cutoff = now_ms - 15 * 60 * 1000
+        buy_usd = sell_usd = 0.0
+        for t in trades:
+            if t["ts_ms"] < cutoff:
+                continue
+            val = t["price"] * t["qty"]
+            if t["side"] == "buy":
+                buy_usd += val
+            else:
+                sell_usd += val
+        return buy_usd - sell_usd
+
+
+# ====================================================================
+#  Binance Spot — Tier A (kline with taker buy volume)
+# ====================================================================
+class BinanceSpot(BaseSpotExchange):
+    name = "Binance"
+    BASE = "https://api.binance.com"
+
+    async def load_spot_symbols(self):
+        data = await http_get(self.client, f"{self.BASE}/api/v3/exchangeInfo")
+        self._spot_bases = {
+            s["baseAsset"].upper()
+            for s in data["symbols"]
+            if s["status"] == "TRADING" and s["quoteAsset"] == "USDT"
+        }
+        logger.info(f"{self.name} Spot: {len(self._spot_bases)} USDT pairs")
+
+    def format_symbol(self, base):
+        return f"{base.upper()}USDT"
+
+    async def get_15min_netflow_usd(self, base):
+        data = await http_get(
+            self.client,
+            f"{self.BASE}/api/v3/klines",
+            params={"symbol": self.format_symbol(base), "interval": "15m", "limit": "2"},
+            sem=self._sem,
+        )
+        # data[0]=completed candle, data[1]=current incomplete
+        candle = data[0]
+        total_quote = float(candle[7])
+        taker_buy_quote = float(candle[10])
+        return 2 * taker_buy_quote - total_quote
+
+    async def get_price_1h(self, base):
+        """(price_now, price_1h_ago)"""
+        data = await http_get(
+            self.client,
+            f"{self.BASE}/api/v3/klines",
+            params={"symbol": self.format_symbol(base), "interval": "15m", "limit": "5"},
+            sem=self._sem,
+        )
+        if not data or len(data) < 2:
+            return None, None
+        return float(data[-1][4]), float(data[0][4])
+
+
+# ====================================================================
+#  OKX Spot — Tier B (trades, limit 500)
+# ====================================================================
+class OkxSpot(TradesSpotExchange):
+    name = "OKX"
+    BASE = "https://www.okx.com"
+
+    async def load_spot_symbols(self):
+        data = await http_get(
+            self.client,
+            f"{self.BASE}/api/v5/public/instruments",
+            params={"instType": "SPOT"},
+        )
+        self._spot_bases = set()
+        for inst in data.get("data", []):
+            if inst.get("state") == "live" and inst.get("quoteCcy") == "USDT":
+                self._spot_bases.add(inst["baseCcy"].upper())
+        logger.info(f"{self.name} Spot: {len(self._spot_bases)} USDT pairs")
+
+    def format_symbol(self, base):
+        return f"{base.upper()}-USDT"
+
+    async def _fetch_raw_trades(self, base):
+        data = await http_get(
+            self.client,
+            f"{self.BASE}/api/v5/market/trades",
+            params={"instId": self.format_symbol(base), "limit": "500"},
+            sem=self._sem,
+        )
+        return [
+            {
+                "ts_ms": float(t["ts"]),
+                "price": float(t["px"]),
+                "qty": float(t["sz"]),
+                "side": t["side"],  # "buy"/"sell"
+            }
+            for t in data.get("data", [])
+        ]
+
+
+# ====================================================================
+#  Bybit Spot — Tier B (trades, hardcap 60)
+# ====================================================================
+class BybitSpot(TradesSpotExchange):
+    name = "Bybit"
+    BASE = "https://api.bybit.com"
+
+    async def load_spot_symbols(self):
+        data = await http_get(
+            self.client,
+            f"{self.BASE}/v5/market/instruments-info",
+            params={"category": "spot"},
+        )
+        self._spot_bases = {
+            s["baseCoin"].upper()
+            for s in data["result"]["list"]
+            if s["status"] == "Trading" and s["quoteCoin"] == "USDT"
+        }
+        logger.info(f"{self.name} Spot: {len(self._spot_bases)} USDT pairs")
+
+    def format_symbol(self, base):
+        return f"{base.upper()}USDT"
+
+    async def _fetch_raw_trades(self, base):
+        data = await http_get(
+            self.client,
+            f"{self.BASE}/v5/market/recent-trade",
+            params={"category": "spot", "symbol": self.format_symbol(base), "limit": "1000"},
+            sem=self._sem,
+        )
+        return [
+            {
+                "ts_ms": float(t["time"]),
+                "price": float(t["price"]),
+                "qty": float(t["size"]),
+                "side": t["side"].lower(),  # "Buy"→"buy"
+            }
+            for t in data["result"]["list"]
+        ]
+
+
+# ====================================================================
+#  Bitget Spot — Tier B (trades, max 100)
+# ====================================================================
+class BitgetSpot(TradesSpotExchange):
+    name = "Bitget"
+    BASE = "https://api.bitget.com"
+
+    async def load_spot_symbols(self):
+        data = await http_get(self.client, f"{self.BASE}/api/v2/spot/public/symbols")
+        self._spot_bases = {
+            s["baseCoin"].upper()
+            for s in data["data"]
+            if s["status"] == "online" and s["quoteCoin"] == "USDT"
+        }
+        logger.info(f"{self.name} Spot: {len(self._spot_bases)} USDT pairs")
+
+    def format_symbol(self, base):
+        return f"{base.upper()}USDT"
+
+    async def _fetch_raw_trades(self, base):
+        data = await http_get(
+            self.client,
+            f"{self.BASE}/api/v2/spot/market/fills",
+            params={"symbol": self.format_symbol(base), "limit": "100"},
+            sem=self._sem,
+        )
+        return [
+            {
+                "ts_ms": float(t["ts"]),
+                "price": float(t["price"]),
+                "qty": float(t["size"]),
+                "side": t["side"],  # "buy"/"sell"
+            }
+            for t in data["data"]
+        ]
+
+
+# ====================================================================
+#  HTX Spot — Tier B (trades, size=2000, nested batches)
+# ====================================================================
+class HtxSpot(TradesSpotExchange):
+    name = "HTX"
+    BASE = "https://api.huobi.pro"
+
+    async def load_spot_symbols(self):
+        data = await http_get(self.client, f"{self.BASE}/v2/settings/common/symbols")
+        self._spot_bases = set()
+        for s in data["data"]:
+            if s.get("state") == "online" and s.get("qc") == "usdt":
+                self._spot_bases.add(s["bcdn"].upper())
+        logger.info(f"{self.name} Spot: {len(self._spot_bases)} USDT pairs")
+
+    def format_symbol(self, base):
+        return f"{base.lower()}usdt"
+
+    async def _fetch_raw_trades(self, base):
+        data = await http_get(
+            self.client,
+            f"{self.BASE}/market/history/trade",
+            params={"symbol": self.format_symbol(base), "size": 2000},
+            sem=self._sem,
+        )
+        results = []
+        for batch in data.get("data", []):
+            for t in batch.get("data", []):
+                results.append({
+                    "ts_ms": float(t["ts"]),
+                    "price": float(t["price"]),
+                    "qty": float(t["amount"]),
+                    "side": t["direction"],  # "buy"/"sell"
+                })
+        return results
+
+
+# ====================================================================
+#  Gate Spot — Tier B (trades, limit=1000)
+# ====================================================================
+class GateSpot(TradesSpotExchange):
+    name = "Gate"
+    BASE = "https://api.gateio.ws"
+
+    async def load_spot_symbols(self):
+        data = await http_get(self.client, f"{self.BASE}/api/v4/spot/currency_pairs")
+        self._spot_bases = set()
+        for p in data:
+            if p.get("trade_status") == "tradable" and p.get("quote") == "USDT":
+                self._spot_bases.add(p["base"].upper())
+        logger.info(f"{self.name} Spot: {len(self._spot_bases)} USDT pairs")
+
+    def format_symbol(self, base):
+        return f"{base.upper()}_USDT"
+
+    async def _fetch_raw_trades(self, base):
+        data = await http_get(
+            self.client,
+            f"{self.BASE}/api/v4/spot/trades",
+            params={"currency_pair": self.format_symbol(base), "limit": 1000},
+            sem=self._sem,
+        )
+        return [
+            {
+                "ts_ms": float(t["create_time_ms"]),
+                "price": float(t["price"]),
+                "qty": float(t["amount"]),
+                "side": t["side"],  # "buy"/"sell"
+            }
+            for t in data
+        ]
+
+
+# ====================================================================
+#  MEXC Spot — Tier B (trades, max 201, isBuyerMaker)
+# ====================================================================
+class MexcSpot(TradesSpotExchange):
+    name = "MEXC"
+    BASE = "https://api.mexc.com"
+
+    async def load_spot_symbols(self):
+        data = await http_get(self.client, f"{self.BASE}/api/v3/exchangeInfo")
+        self._spot_bases = {
+            s["baseAsset"].upper()
+            for s in data["symbols"]
+            if str(s.get("status")) == "1" and s.get("quoteAsset") == "USDT"
+            and s.get("isSpotTradingAllowed")
+        }
+        logger.info(f"{self.name} Spot: {len(self._spot_bases)} USDT pairs")
+
+    def format_symbol(self, base):
+        return f"{base.upper()}USDT"
+
+    async def _fetch_raw_trades(self, base):
+        data = await http_get(
+            self.client,
+            f"{self.BASE}/api/v3/trades",
+            params={"symbol": self.format_symbol(base), "limit": 1000},
+            sem=self._sem,
+        )
+        return [
+            {
+                "ts_ms": float(t["time"]),
+                "price": float(t["price"]),
+                "qty": float(t["qty"]),
+                # isBuyerMaker=false → taker is buy; true → taker is sell
+                "side": "sell" if t.get("isBuyerMaker") else "buy",
+            }
+            for t in data
+        ]
+
+
+# ====================================================================
+#  KuCoin Spot — Tier B (trades, fixed 100, nanosecond timestamps)
+# ====================================================================
+class KucoinSpot(TradesSpotExchange):
+    name = "KuCoin"
+    BASE = "https://api.kucoin.com"
+
+    async def load_spot_symbols(self):
+        data = await http_get(self.client, f"{self.BASE}/api/v1/symbols")
+        self._spot_bases = set()
+        for s in data.get("data", []):
+            if s.get("enableTrading") and s.get("quoteCurrency") == "USDT":
+                self._spot_bases.add(s["baseCurrency"].upper())
+        logger.info(f"{self.name} Spot: {len(self._spot_bases)} USDT pairs")
+
+    def format_symbol(self, base):
+        return f"{base.upper()}-USDT"
+
+    async def _fetch_raw_trades(self, base):
+        data = await http_get(
+            self.client,
+            f"{self.BASE}/api/v1/market/histories",
+            params={"symbol": self.format_symbol(base)},
+            sem=self._sem,
+        )
+        return [
+            {
+                "ts_ms": float(t["time"]) / 1_000_000,  # nanoseconds → ms
+                "price": float(t["price"]),
+                "qty": float(t["size"]),
+                "side": t["side"],  # "buy"/"sell"
+            }
+            for t in data.get("data", [])
+        ]
+
+
+# ====================================================================
+#  Universe: Binance ∩ OKX perpetual intersection − excluded
+# ====================================================================
+async def get_universe(bf: BinanceFutures, okx: OkxSwap):
+    b_syms, o_syms = await asyncio.gather(bf.get_perp_symbols(), okx.get_perp_symbols())
+    universe = (b_syms & o_syms) - CONFIG["excluded_symbols"]
+    return sorted(universe)
+
+
+# ====================================================================
+#  Netflow history update (one round)
+# ====================================================================
+async def update_netflow_history(universe, spot_clients):
+    """Fetch 15min netflow for all symbols from all exchanges, update deques."""
+    statuses = {}
+
+    async def fetch_one_exchange(exchange):
+        ok_count = fail_count = 0
+        eligible = [b for b in universe if exchange.has_symbol(b)]
+        if not eligible:
+            statuses[exchange.name] = (0, 0)
+            return
+
+        async def fetch_one(base):
+            nonlocal ok_count, fail_count
+            try:
+                nf = await exchange.get_15min_netflow_usd(base)
+                netflow_history[base][exchange.name].append(nf)
+                ok_count += 1
+            except Exception as e:
+                fail_count += 1
+                logger.warning(f"{exchange.name} netflow {base}: {e}")
+
+        await asyncio.gather(*[fetch_one(b) for b in eligible])
+        statuses[exchange.name] = (ok_count, fail_count)
+
+    await asyncio.gather(*[fetch_one_exchange(ex) for ex in spot_clients])
+    return statuses
+
+
+# ====================================================================
+#  Per-symbol data fetch (OI, funding, price)
+# ====================================================================
+async def fetch_symbol_data(base, bf: BinanceFutures, okx: OkxSwap, bn_spot: BinanceSpot):
+    results = await asyncio.gather(
+        bf.get_oi_history(base),
+        bf.get_funding_current(base),
+        bf.get_funding_history(base, limit=3),
+        okx.get_oi_history(base),
+        okx.get_funding_current(base),
+        okx.get_funding_history(base, limit=3),
+        bn_spot.get_price_1h(base),
+        return_exceptions=True,
+    )
+    # Unpack, replacing exceptions with defaults
+    def safe(idx, default):
+        v = results[idx]
+        return default if isinstance(v, Exception) else v
+
+    bn_oi_now, bn_oi_1h = safe(0, (None, None))
+    bn_fr_cur = safe(1, None)
+    bn_fr_hist = safe(2, [])
+    ok_oi_now, ok_oi_1h = safe(3, (None, None))
+    ok_fr_cur = safe(4, None)
+    ok_fr_hist = safe(5, [])
+    price_now, price_1h = safe(6, (None, None))
+
+    return {
+        "bn_oi_now": bn_oi_now, "bn_oi_1h": bn_oi_1h,
+        "ok_oi_now": ok_oi_now, "ok_oi_1h": ok_oi_1h,
+        "bn_fr_cur": bn_fr_cur, "bn_fr_hist": bn_fr_hist,
+        "ok_fr_cur": ok_fr_cur, "ok_fr_hist": ok_fr_hist,
+        "price_now": price_now, "price_1h": price_1h,
+    }
+
+
+# ====================================================================
+#  Rule Engine
+# ====================================================================
+def rule_r1(d):
+    """OI 异常增长: oi_growth >= 3 * |price_growth|"""
+    # Aggregate OI
+    oi_now_parts = [v for v in [d["bn_oi_now"], d["ok_oi_now"]] if v is not None]
+    oi_1h_parts = [v for v in [d["bn_oi_1h"], d["ok_oi_1h"]] if v is not None]
+    if not oi_now_parts or not oi_1h_parts or len(oi_now_parts) != len(oi_1h_parts):
+        return False, "", {}
+    oi_now = sum(oi_now_parts)
+    oi_1h = sum(oi_1h_parts)
+    if oi_1h <= 0 or d["price_1h"] is None or d["price_1h"] <= 0:
+        return False, "", {}
+    oi_growth = (oi_now - oi_1h) / oi_1h
+    price_growth = (d["price_now"] - d["price_1h"]) / d["price_1h"]
+    if oi_growth <= 0:
+        return False, "", {}
+    ratio = CONFIG["rules"]["r1_oi_vs_price_ratio"]
+    if abs(price_growth) == 0:
+        triggered = True
+        reason = f"OI 1h +{oi_growth:.1%}, 价格不变 (∞×)"
+    elif oi_growth >= ratio * abs(price_growth):
+        mult = oi_growth / abs(price_growth)
+        reason = f"OI 1h +{oi_growth:.1%}, 价格 {price_growth:+.1%} ({mult:.1f}×)"
+        triggered = True
+    else:
+        return False, "", {}
+    extra = {
+        "oi_now": oi_now, "oi_1h": oi_1h, "oi_growth": oi_growth,
+        "price_growth": price_growth,
+        "bn_oi_now": d["bn_oi_now"], "ok_oi_now": d["ok_oi_now"],
+        "bn_oi_1h": d["bn_oi_1h"], "ok_oi_1h": d["ok_oi_1h"],
+    }
+    return triggered, reason, extra
+
+
+def rule_r2(d):
+    """资金费率持续为负: 过去 3 期 (24h) 全部 < 0"""
+    n = CONFIG["rules"]["r2_negative_funding_periods"]
+    sources = []
+    if len(d["bn_fr_hist"]) >= n and all(fr < 0 for fr in d["bn_fr_hist"][:n]):
+        sources.append("Binance")
+    if len(d["ok_fr_hist"]) >= n and all(fr < 0 for fr in d["ok_fr_hist"][:n]):
+        sources.append("OKX")
+    if not sources:
+        return False, "", {}
+    reason = f"过去 {n} 期资金费率全负 ({', '.join(sources)})"
+    return True, reason, {"sources": sources}
+
+
+def rule_r3(d):
+    """资金费率极值: 当前 FR <= threshold"""
+    threshold = CONFIG["rules"]["r3_funding_rate_threshold"]
+    hits = []
+    if d["bn_fr_cur"] is not None and d["bn_fr_cur"] <= threshold:
+        hits.append(("Binance", d["bn_fr_cur"]))
+    if d["ok_fr_cur"] is not None and d["ok_fr_cur"] <= threshold:
+        hits.append(("OKX", d["ok_fr_cur"]))
+    if not hits:
+        return False, "", {}
+    parts = [f"{name} {fr:.3%}" for name, fr in hits]
+    reason = f"资金费率 {' / '.join(parts)} ≤ {threshold:.2%}"
+    return True, reason, {"hits": hits}
+
+
+def rule_r4(base):
+    """现货净流异常: 8 家聚合 1h |netflow| >= threshold"""
+    threshold = CONFIG["rules"]["r4_netflow_threshold_usd"]
+    min_ex = CONFIG["netflow_min_exchanges"]
+    per_exchange_1h = {}
+    for ex_name, windows in netflow_history[base].items():
+        if len(windows) < CONFIG["netflow_window_count"]:
+            continue
+        per_exchange_1h[ex_name] = sum(windows)
+    if len(per_exchange_1h) < min_ex:
+        return False, f"数据不足({len(per_exchange_1h)}/{min_ex}家)", per_exchange_1h
+    total_1h = sum(per_exchange_1h.values())
+    if abs(total_1h) >= threshold:
+        direction = "净流入" if total_1h > 0 else "净流出"
+        reason = f"8家聚合{direction} ${abs(total_1h):,.0f}"
+        return True, reason, per_exchange_1h
+    return False, "", per_exchange_1h
+
+
+def evaluate(base, data):
+    r1_hit, r1_reason, r1_extra = rule_r1(data)
+    r2_hit, r2_reason, r2_extra = rule_r2(data)
+    r3_hit, r3_reason, r3_extra = rule_r3(data)
+    r4_hit, r4_reason, r4_extra = rule_r4(base)
+
+    hits = []
+    if r3_hit:
+        hits.append(("R3", r3_reason))
+    if r1_hit:
+        hits.append(("R1", r1_reason))
+    if r2_hit:
+        hits.append(("R2", r2_reason))
+    if r4_hit:
+        hits.append(("R4", r4_reason))
+
+    if not hits:
+        level = "🟢"
+    elif r3_hit:
+        level = "🔴"
+    elif r1_hit or r2_hit:
+        level = "🟠"
+    else:
+        level = "🟡"
+
+    # Compute netflow total for display
+    total_1h_nf = sum(
+        sum(w) for w in netflow_history[base].values()
+        if len(w) >= CONFIG["netflow_window_count"]
+    )
+
+    return {
+        "level": level,
+        "hits": hits,
+        "r1_extra": r1_extra,
+        "r4_extra": r4_extra,
+        "total_1h_netflow": total_1h_nf,
+    }
+
+
+# ====================================================================
+#  Level change detection
+# ====================================================================
+LEVEL_ORDER = {"🟢": 0, "🟡": 1, "🟠": 2, "🔴": 3}
+
+
+def detect_level_change(base, new_level):
+    old = last_levels.get(base, "🟢")
+    old_val = LEVEL_ORDER.get(old, 0)
+    new_val = LEVEL_ORDER.get(new_level, 0)
+    if new_val > old_val:
+        return "⬆️⬆️"
+    elif new_val < old_val:
+        return "⬇️"
+    return ""
+
+
+# ====================================================================
+#  Telegram push
+# ====================================================================
+LEVEL_LABELS = {"🔴": "行动信号", "🟠": "预警信号", "🟡": "关注信号"}
+
+
+def _fmt_usd(val):
+    if val is None:
+        return "N/A"
+    abs_v = abs(val)
+    sign = "+" if val >= 0 else "-"
+    if abs_v >= 1e9:
+        return f"{sign}${abs_v / 1e9:.1f}B"
+    if abs_v >= 1e6:
+        return f"{sign}${abs_v / 1e6:.0f}M"
+    if abs_v >= 1e3:
+        return f"{sign}${abs_v / 1e3:.0f}k"
+    return f"{sign}${abs_v:.0f}"
+
+
+def format_tg_message(base, result, data, level_change):
+    lv = result["level"]
+    label = LEVEL_LABELS.get(lv, "信号")
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    price_str = f"${data['price_now']:.4f}" if data["price_now"] else "N/A"
+    price_pct = ""
+    if data["price_now"] and data["price_1h"]:
+        pct = (data["price_now"] - data["price_1h"]) / data["price_1h"]
+        price_pct = f"  1h: {pct:+.1%}"
+
+    # Header
+    lines = [
+        f"{lv} <b>{label}</b> | <b>{base}</b>",
+        "━━━━━━━━━━━━━━━━━",
+        f"💰 现价: <code>{price_str}</code>{price_pct}",
+        "",
+    ]
+
+    # Rules hit
+    if result["hits"]:
+        lines.append("🎯 <b>命中规则</b>")
+        for tag, reason in result["hits"]:
+            lines.append(f"- {tag}: {reason}")
+        lines.append("")
+
+    # OI
+    r1x = result.get("r1_extra", {})
+    if r1x.get("oi_now") is not None:
+        lines.append("📊 <b>OI</b>")
+        lines.append(f"- 总: {_fmt_usd(r1x.get('oi_now'))} ← {_fmt_usd(r1x.get('oi_1h'))} (1h 前)")
+        bn_oi = _fmt_usd(r1x.get("bn_oi_now"))
+        ok_oi = _fmt_usd(r1x.get("ok_oi_now"))
+        lines.append(f"- Binance: {bn_oi} | OKX: {ok_oi}")
+        lines.append("")
+
+    # Funding rates
+    bn_fr = data.get("bn_fr_cur")
+    ok_fr = data.get("ok_fr_cur")
+    if bn_fr is not None or ok_fr is not None:
+        lines.append("📈 <b>资金费率</b>")
+        parts = []
+        if bn_fr is not None:
+            parts.append(f"Binance: {bn_fr:.3%}")
+        if ok_fr is not None:
+            parts.append(f"OKX: {ok_fr:.3%}")
+        lines.append(f"- {' | '.join(parts)}")
+        lines.append("")
+
+    # Netflow table
+    r4x = result.get("r4_extra", {})
+    if r4x:
+        lines.append("💵 <b>现货净流(1h · USD)</b>")
+        ex_order = ["Binance", "OKX", "Bybit", "Bitget", "HTX", "Gate", "MEXC", "KuCoin"]
+        rows = []
+        for i in range(0, len(ex_order), 2):
+            left_name = ex_order[i]
+            right_name = ex_order[i + 1] if i + 1 < len(ex_order) else ""
+            left_val = _fmt_usd(r4x.get(left_name)) if left_name in r4x else "  -  "
+            right_val = _fmt_usd(r4x.get(right_name)) if right_name in r4x else "  -  "
+            rows.append(f" {left_name:<9}{left_val:>10}   {right_name:<8}{right_val:>10}")
+        rows.append(" ─────────────────────────────────")
+        total = _fmt_usd(result["total_1h_netflow"])
+        rows.append(f" 合计 {total:>10}")
+        lines.append("<pre>" + "\n".join(rows) + "</pre>")
+        lines.append("")
+
+    # Links
+    lines.append(
+        f'🔗 <a href="https://www.binance.com/en/futures/{base}USDT">Binance 永续</a>'
+        f' | <a href="https://www.coinglass.com/currencies/{base}">Coinglass</a>'
+    )
+
+    # Timestamp + level change
+    suffix = f"· 等级升级 {level_change}" if "⬆" in level_change else (
+        f"· 等级降级 {level_change}" if "⬇" in level_change else ""
+    )
+    lines.append(f"<i>{now_str} {suffix}</i>")
+
+    msg = "\n".join(lines)
+    if len(msg) > 4000:
+        msg = msg[:4000] + "..."
+    return msg
+
+
+async def send_tg_alert(message, http):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        logger.warning("TG credentials not configured, skip push")
+        return False
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    for attempt in range(3):
+        try:
+            r = await http.post(url, json=payload, timeout=10)
+            if r.status_code == 200:
+                return True
+            logger.warning(f"TG push HTTP {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            logger.warning(f"TG push error (attempt {attempt + 1}): {e}")
+        await asyncio.sleep(2 ** attempt)
+    logger.error("TG push final failure")
+    return False
+
+
+# ====================================================================
+#  Log alert as JSON (for post-analysis)
+# ====================================================================
+def log_alert_json(base, result, data):
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "symbol": base,
+        "level": result["level"],
+        "hits": result["hits"],
+        "price_now": data.get("price_now"),
+        "price_1h": data.get("price_1h"),
+        "bn_fr_cur": data.get("bn_fr_cur"),
+        "ok_fr_cur": data.get("ok_fr_cur"),
+        "bn_oi_now": data.get("bn_oi_now"),
+        "ok_oi_now": data.get("ok_oi_now"),
+        "netflow_1h": result["total_1h_netflow"],
+        "netflow_per_exchange": result.get("r4_extra", {}),
+    }
+    logger.warning(json.dumps(record, ensure_ascii=False))
+
+
+# ====================================================================
+#  Main loop
+# ====================================================================
+async def monitor_once(http, bf, okx_swap, spot_clients):
+    global round_count
+    round_count += 1
+    t0 = time.time()
+    bn_spot = spot_clients[0]  # BinanceSpot is always first
+
+    # 1. Universe
+    universe = await get_universe(bf, okx_swap)
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] 第 {round_count} 轮开始 | 币种池 {len(universe)}")
+    logger.info(f"Round {round_count} start: {len(universe)} symbols")
+
+    # 2. Update netflow
+    nf_statuses = await update_netflow_history(universe, spot_clients)
+    status_parts = []
+    for ex in spot_clients:
+        ok_c, fail_c = nf_statuses.get(ex.name, (0, 0))
+        mark = "✓" if fail_c == 0 else f"✗({fail_c})"
+        status_parts.append(f"{ex.name} {mark}")
+    ts2 = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts2}] {' | '.join(status_parts)}")
+
+    # 3. Fetch symbol data & evaluate (parallel, bounded concurrency)
+    sem = asyncio.Semaphore(20)
+    alerts_by_level = {"🔴": [], "🟠": [], "🟡": []}
+
+    async def process_one(base):
+        async with sem:
+            try:
+                data = await fetch_symbol_data(base, bf, okx_swap, bn_spot)
+                result = evaluate(base, data)
+                if result["level"] != "🟢":
+                    level_change = detect_level_change(base, result["level"])
+                    alerts_by_level[result["level"]].append((base, result, data, level_change))
+                    log_alert_json(base, result, data)
+                    last_levels[base] = result["level"]
+            except Exception as e:
+                logger.exception(f"Processing {base} failed: {e}")
+
+    await asyncio.gather(*[process_one(b) for b in universe])
+
+    # 4. Push to TG (sorted by level, 3.5s between messages)
+    total_alerts = 0
+    for level in ["🔴", "🟠", "🟡"]:
+        for base, result, data, level_change in alerts_by_level[level]:
+            msg = format_tg_message(base, result, data, level_change)
+            await send_tg_alert(msg, http)
+            total_alerts += 1
+            if total_alerts < 20:
+                await asyncio.sleep(3.5)
+            else:
+                logger.warning("TG rate limit: >20 alerts this round, stopping push")
+                break
+        else:
+            continue
+        break
+
+    # 5. Status line
+    elapsed = time.time() - t0
+    parts = []
+    for lv in ["🔴", "🟠", "🟡"]:
+        n = len(alerts_by_level[lv])
+        if n > 0:
+            names = " ".join(a[0] for a in alerts_by_level[lv][:3])
+            lvl_change_marks = " ".join(a[3] for a in alerts_by_level[lv][:3] if a[3])
+            parts.append(f"{lv}{n}({names}{' ' + lvl_change_marks if lvl_change_marks else ''})")
+    alert_summary = " | ".join(parts) if parts else "无告警"
+    ts3 = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts3}] 本轮结束 | 耗时 {elapsed:.0f}s | {alert_summary} | TG 推送 {total_alerts} 条")
+    print(f"[{ts3}] Sleep {CONFIG['loop_interval_seconds'] // 60} min...")
+    logger.info(f"Round {round_count} done: {total_alerts} alerts, {elapsed:.1f}s")
+
+
+async def main():
+    http = httpx.AsyncClient(
+        timeout=httpx.Timeout(20, connect=10),
+        limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
+        headers={"User-Agent": "PumpMonitor/3.0"},
+    )
+
+    bf = BinanceFutures(http)
+    okx_swap = OkxSwap(http)
+
+    spot_clients = [
+        BinanceSpot(http),  # index 0 — also used for price
+        OkxSpot(http),
+        BybitSpot(http),
+        BitgetSpot(http),
+        HtxSpot(http),
+        GateSpot(http),
+        MexcSpot(http),
+        KucoinSpot(http),
+    ]
+
+    # Load spot symbol lists (parallel)
+    print("Loading spot symbol lists from 8 exchanges...")
+    results = await asyncio.gather(
+        *[c.load_spot_symbols() for c in spot_clients],
+        return_exceptions=True,
+    )
+    for c, r in zip(spot_clients, results):
+        if isinstance(r, Exception):
+            logger.error(f"{c.name} symbol load failed: {r}")
+
+    warmup_min = CONFIG["netflow_window_count"] * CONFIG["loop_interval_seconds"] // 60
+    startup_msg = (
+        f"✅ 监控脚本已启动\n"
+        f"• 币种池: Binance ∩ OKX 永续交集\n"
+        f"• 现货 Netflow: 8 家聚合\n"
+        f"• R4 需要预热 {warmup_min} 分钟后才开始触发"
+    )
+    await send_tg_alert(startup_msg, http)
+    print(f"Startup complete. R4 warmup: {warmup_min} min. Starting monitor loop...")
+
+    try:
+        while True:
+            try:
+                await monitor_once(http, bf, okx_swap, spot_clients)
+            except Exception as e:
+                logger.exception(f"Round failed: {e}")
+                await asyncio.sleep(60)
+                continue
+            await asyncio.sleep(CONFIG["loop_interval_seconds"])
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
+    finally:
+        try:
+            await send_tg_alert("🛑 监控脚本已手动停止", http)
+        except Exception:
+            pass
+        await http.aclose()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[Ctrl+C] 退出完成")
