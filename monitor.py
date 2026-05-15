@@ -1,9 +1,15 @@
 """
-加密货币拉升预警监控 v3
+加密货币拉升预警监控 v4
 ========================
 
-识别"空头陷阱型拉升"信号:OI 异常增长、资金费率持续为负、现货净流入异常。
+识别拉升信号:OI 异常增长、资金费率持续为负/极值、现货净流入异常、OI+正费率多头信号。
 8 家交易所聚合数据,Telegram 群实时推送。
+
+v4 改进:
+    - 评分机制: 多规则联合触发的信号才推送 TG,单规则仅记日志,大幅降低噪音
+    - 2h 信号记忆窗口: 不同轮次触发的规则会被关联,形成综合评分
+    - 新增 R5: OI 增长 + 正费率 (≥+0.05%) = 多头主导拉升信号
+    - 6h 总结按规则多样性排序,而非简单计数
 
 安装依赖:
     pip install -r requirements.txt
@@ -23,18 +29,23 @@
 启动:
     python monitor.py
 
-四条规则:
-    R1 OI 异常增长     1h OI 增长率 >= 3x 价格涨幅           🟠 预警
-    R2 资金费率持续负   过去 24h(3期) 所有结算均 < 0          🟠 预警
-    R3 资金费率极值     当前资金费率 <= -0.05%                🔴 行动
-    R4 现货净流异常     8 家聚合 1h 净流入/出 >= $500,000     🟡 关注
+五条规则:
+    R1 OI 异常增长       1h OI 增长率 >= 3x 价格涨幅           🟠 预警
+    R2 资金费率持续负     过去 24h(3期) 所有结算均 < 0          🟠 预警
+    R3 资金费率极值       当前资金费率 <= -0.05%                🔴 行动
+    R4 现货净流异常       8 家聚合 1h 净流入/出 >= $500,000     🟡 关注
+    R5 OI增长+正费率     OI 异常增长且正费率 >= +0.05%         🟠 预警
+
+推送规则:
+    🔴 级别(R3): 单条即推送
+    其余: 2h 窗口内 ≥2 条不同规则触发才推送,单条仅记日志
 
 R4 预热期: 启动后需 45~60 分钟累积 4 个 15min 窗口后才开始触发。
 
 日志: logs/monitor.log (日级轮转,保留 30 天)
     告警级别 WARNING(JSON 格式),可用 jq / pandas 查询。
 
-调阈值: 修改脚本内 CONFIG 字典的 rules 部分。
+调阈值: 修改脚本内 CONFIG 字典的 rules / scoring 部分。
 """
 
 import asyncio
@@ -53,9 +64,18 @@ load_dotenv()
 
 # ============ CONFIG ============
 CONFIG = {
-    "loop_interval_seconds": 900,
+    "loop_interval_seconds": 1800,
     "netflow_window_count": 4,
     "netflow_min_exchanges": 4,
+    "scoring": {
+        "memory_window_rounds": 8,          # 2h = 8 × 15min 信号记忆窗口
+        "push_min_rules": 2,                # ≥2 条不同规则才推送 TG
+        "push_override_levels": {"🔴"},     # 🔴 级别单条也推送
+        "rule_base_scores": {
+            "R1": 3, "R2": 2, "R3": 5, "R4": 2, "R5": 3,
+        },
+        "multi_rule_multiplier": 1.5,       # 每多一条规则 score ×1.5
+    },
     "rules": {
         "r1_oi_vs_price_ratio": 3.0,
         "r1_oi_growth_min_pct": 0.033,         # OI 增长率不低于 3.3%
@@ -64,6 +84,9 @@ CONFIG = {
         "r2_negative_funding_periods": 3,
         "r3_funding_rate_threshold": -0.0005,
         "r4_netflow_threshold_usd": 500_000,
+        "r5_oi_growth_min_pct": 0.033,         # R5: OI 增长率门槛 (同 R1)
+        "r5_oi_growth_min_usd": 50_000,         # R5: OI 绝对增长门槛 (同 R1)
+        "r5_positive_funding_threshold": 0.0005, # R5: 正 funding ≥ +0.05%
     },
     "excluded_symbols": {
         "BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "TRX", "TON",
@@ -98,6 +121,10 @@ round_count = 0
 # 6h summary accumulator: list of alert records per summary window
 summary_alerts: list[dict] = []
 last_summary_hour: int = -1
+# 2h signal memory: {symbol: deque of (round_number, frozenset_of_rule_tags)}
+signal_memory: dict[str, deque] = defaultdict(
+    lambda: deque(maxlen=CONFIG["scoring"]["memory_window_rounds"])
+)
 
 
 # ====================================================================
@@ -805,30 +832,112 @@ def rule_r4(base):
     return False, "", per_exchange_1h
 
 
+def rule_r5(d):
+    """OI 异常增长 + 正资金费率: 多头主导的积极拉升信号。"""
+    # --- OI growth check (same logic as R1) ---
+    oi_now_parts = [v for v in [d["bn_oi_now"], d["ok_oi_now"]] if v is not None]
+    oi_1h_parts = [v for v in [d["bn_oi_1h"], d["ok_oi_1h"]] if v is not None]
+    if not oi_now_parts or not oi_1h_parts or len(oi_now_parts) != len(oi_1h_parts):
+        return False, "", {}
+    oi_now = sum(oi_now_parts)
+    oi_1h = sum(oi_1h_parts)
+    if oi_1h <= 0:
+        return False, "", {}
+
+    oi_growth = (oi_now - oi_1h) / oi_1h
+    oi_growth_usd = oi_now - oi_1h
+
+    if oi_growth <= 0:
+        return False, "", {}
+
+    rules = CONFIG["rules"]
+    min_pct = rules["r5_oi_growth_min_pct"]
+    min_usd = rules["r5_oi_growth_min_usd"]
+    fr_threshold = rules["r5_positive_funding_threshold"]
+
+    if oi_growth < min_pct or oi_growth_usd < min_usd:
+        return False, "", {}
+
+    # --- Positive funding check ---
+    fr_values = [v for v in [d["bn_fr_cur"], d["ok_fr_cur"]] if v is not None]
+    if not fr_values:
+        return False, "", {}
+    avg_fr = sum(fr_values) / len(fr_values)
+    if avg_fr < fr_threshold:
+        return False, "", {}
+
+    reason = (
+        f"OI 1h +{oi_growth:.1%} (+${oi_growth_usd:,.0f}), "
+        f"正费率 {avg_fr:.3%} (多头主导)"
+    )
+    extra = {
+        "oi_now": oi_now, "oi_1h": oi_1h, "oi_growth": oi_growth,
+        "oi_growth_usd": oi_growth_usd, "avg_funding_rate": avg_fr,
+    }
+    return True, reason, extra
+
+
 def evaluate(base, data):
     r1_hit, r1_reason, r1_extra = rule_r1(data)
     r2_hit, r2_reason, r2_extra = rule_r2(data)
     r3_hit, r3_reason, r3_extra = rule_r3(data)
     r4_hit, r4_reason, r4_extra = rule_r4(base)
+    r5_hit, r5_reason, r5_extra = rule_r5(data)
 
+    # Current round hits
     hits = []
+    current_round_tags = set()
     if r3_hit:
         hits.append(("R3", r3_reason))
+        current_round_tags.add("R3")
     if r1_hit:
         hits.append(("R1", r1_reason))
+        current_round_tags.add("R1")
     if r2_hit:
         hits.append(("R2", r2_reason))
+        current_round_tags.add("R2")
     if r4_hit:
         hits.append(("R4", r4_reason))
+        current_round_tags.add("R4")
+    if r5_hit:
+        hits.append(("R5", r5_reason))
+        current_round_tags.add("R5")
 
-    if not hits:
+    # --- Signal memory: 2h sliding window ---
+    if current_round_tags:
+        signal_memory[base].append((round_count, frozenset(current_round_tags)))
+
+    # Compute recent_rules: union of all rule tags in the memory window
+    recent_rules = set()
+    for _rnd, tags in signal_memory[base]:
+        recent_rules.update(tags)
+
+    # --- Scoring ---
+    scoring_cfg = CONFIG["scoring"]
+    base_scores = scoring_cfg["rule_base_scores"]
+    score = sum(base_scores.get(tag, 0) for tag in recent_rules)
+    if len(recent_rules) >= 2:
+        score *= scoring_cfg["multi_rule_multiplier"] ** (len(recent_rules) - 1)
+
+    # --- Level (based on highest-severity in recent_rules) ---
+    if not recent_rules:
         level = "🟢"
-    elif r3_hit:
+    elif "R3" in recent_rules:
         level = "🔴"
-    elif r1_hit or r2_hit:
+    elif recent_rules & {"R1", "R2", "R5"}:
         level = "🟠"
     else:
         level = "🟡"
+
+    # --- Should push? ---
+    # Only push if this round has at least one active hit (avoid re-pushing
+    # purely from memory when nothing new triggered this round)
+    should_push = False
+    if current_round_tags:
+        if level in scoring_cfg["push_override_levels"]:
+            should_push = True       # 🔴 always pushes
+        elif len(recent_rules) >= scoring_cfg["push_min_rules"]:
+            should_push = True       # multi-rule fusion → push
 
     # Compute netflow total for display
     total_1h_nf = sum(
@@ -840,8 +949,13 @@ def evaluate(base, data):
         "level": level,
         "hits": hits,
         "r1_extra": r1_extra,
+        "r5_extra": r5_extra,
         "r4_extra": r4_extra,
         "total_1h_netflow": total_1h_nf,
+        "score": round(score, 1),
+        "recent_rules": sorted(recent_rules),
+        "current_round_hits": sorted(current_round_tags),
+        "should_push": should_push,
     }
 
 
@@ -886,6 +1000,9 @@ def format_tg_message(base, result, data, level_change):
     lv = result["level"]
     label = LEVEL_LABELS.get(lv, "信号")
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    score = result.get("score", 0)
+    recent_rules = result.get("recent_rules", [])
+    current_hits = result.get("current_round_hits", [])
 
     price_str = f"${data['price_now']:.4f}" if data["price_now"] else "N/A"
     price_pct = ""
@@ -893,13 +1010,19 @@ def format_tg_message(base, result, data, level_change):
         pct = (data["price_now"] - data["price_1h"]) / data["price_1h"]
         price_pct = f"  1h: {pct:+.1%}"
 
-    # Header
+    # Header with score
     lines = [
-        f"{lv} <b>{label}</b> | <b>{base}</b>",
+        f"{lv} <b>{label}</b> | <b>{base}</b> | ⚡{score}分",
         "━━━━━━━━━━━━━━━━━",
         f"💰 现价: <code>{price_str}</code>{price_pct}",
-        "",
     ]
+
+    # Signal fusion info
+    if recent_rules:
+        recent_str = ", ".join(recent_rules)
+        current_str = ", ".join(current_hits) if current_hits else "—"
+        lines.append(f"📡 2h 内触发: {recent_str} (本轮: {current_str})")
+    lines.append("")
 
     # Rules hit
     if result["hits"]:
@@ -908,14 +1031,17 @@ def format_tg_message(base, result, data, level_change):
             lines.append(f"- {tag}: {reason}")
         lines.append("")
 
-    # OI
+    # OI (from R1 or R5)
     r1x = result.get("r1_extra", {})
-    if r1x.get("oi_now") is not None:
+    r5x = result.get("r5_extra", {})
+    oi_extra = r1x if r1x.get("oi_now") is not None else r5x
+    if oi_extra.get("oi_now") is not None:
         lines.append("📊 <b>OI</b>")
-        lines.append(f"- 总: {_fmt_usd(r1x.get('oi_now'))} ← {_fmt_usd(r1x.get('oi_1h'))} (1h 前)")
-        bn_oi = _fmt_usd(r1x.get("bn_oi_now"))
-        ok_oi = _fmt_usd(r1x.get("ok_oi_now"))
-        lines.append(f"- Binance: {bn_oi} | OKX: {ok_oi}")
+        lines.append(f"- 总: {_fmt_usd(oi_extra.get('oi_now'))} ← {_fmt_usd(oi_extra.get('oi_1h'))} (1h 前)")
+        bn_oi = _fmt_usd(oi_extra.get("bn_oi_now"))
+        ok_oi = _fmt_usd(oi_extra.get("ok_oi_now"))
+        if bn_oi != "N/A" or ok_oi != "N/A":
+            lines.append(f"- Binance: {bn_oi} | OKX: {ok_oi}")
         lines.append("")
 
     # Funding rates
@@ -929,6 +1055,9 @@ def format_tg_message(base, result, data, level_change):
         if ok_fr is not None:
             parts.append(f"OKX: {ok_fr:.3%}")
         lines.append(f"- {' | '.join(parts)}")
+        # R5: show positive funding note
+        if r5x.get("avg_funding_rate") is not None:
+            lines.append(f"- 🟢 正费率均值: {r5x['avg_funding_rate']:.3%} (多头主导)")
         lines.append("")
 
     # Netflow table
@@ -1000,6 +1129,10 @@ def log_alert_json(base, result, data):
         "symbol": base,
         "level": result["level"],
         "hits": result["hits"],
+        "score": result.get("score", 0),
+        "recent_rules": result.get("recent_rules", []),
+        "current_round_hits": result.get("current_round_hits", []),
+        "should_push": result.get("should_push", False),
         "price_now": data.get("price_now"),
         "price_1h": data.get("price_1h"),
         "bn_fr_cur": data.get("bn_fr_cur"),
@@ -1039,37 +1172,57 @@ async def monitor_once(http, bf, okx_swap, spot_clients):
 
     # 3. Fetch symbol data & evaluate (parallel, bounded concurrency)
     sem = asyncio.Semaphore(20)
-    alerts_by_level = {"🔴": [], "🟠": [], "🟡": []}
+    push_alerts_by_level = {"🔴": [], "🟠": [], "🟡": []}
+    log_only_count = 0
 
     async def process_one(base):
+        nonlocal log_only_count
         async with sem:
             try:
                 data = await fetch_symbol_data(base, bf, okx_swap, bn_spot)
                 result = evaluate(base, data)
-                if result["level"] != "🟢":
+                # Only act on coins with current-round hits (not purely from memory)
+                if result["current_round_hits"]:
                     level_change = detect_level_change(base, result["level"])
-                    alerts_by_level[result["level"]].append((base, result, data, level_change))
+                    # Always log to file
                     log_alert_json(base, result, data)
                     last_levels[base] = result["level"]
-                    # Accumulate for 6h summary
+                    # Accumulate for 6h summary (richer info)
                     summary_alerts.append({
                         "symbol": base,
                         "level": result["level"],
                         "hits": result["hits"],
+                        "score": result["score"],
+                        "recent_rules": result["recent_rules"],
+                        "current_round_hits": result["current_round_hits"],
+                        "should_push": result["should_push"],
                     })
+                    # Split: push to TG only if should_push
+                    if result["should_push"]:
+                        push_alerts_by_level[result["level"]].append(
+                            (base, result, data, level_change)
+                        )
+                    else:
+                        log_only_count += 1
+                        logger.info(
+                            f"{base} 单规则触发 {result['current_round_hits']} "
+                            f"score={result['score']} → 仅记录"
+                        )
             except Exception as e:
                 logger.exception(f"Processing {base} failed: {e}")
 
     await asyncio.gather(*[process_one(b) for b in universe])
 
-    # 4. Push to TG (sorted by level, 3.5s between messages)
-    total_alerts = 0
+    # 4. Push to TG (sorted by score within each level, 3.5s between messages)
+    total_pushed = 0
     for level in ["🔴", "🟠", "🟡"]:
-        for base, result, data, level_change in alerts_by_level[level]:
+        # Sort by score descending within each level
+        push_alerts_by_level[level].sort(key=lambda x: x[1]["score"], reverse=True)
+        for base, result, data, level_change in push_alerts_by_level[level]:
             msg = format_tg_message(base, result, data, level_change)
             await send_tg_alert(msg, http)
-            total_alerts += 1
-            if total_alerts < 20:
+            total_pushed += 1
+            if total_pushed < 20:
                 await asyncio.sleep(3.5)
             else:
                 logger.warning("TG rate limit: >20 alerts this round, stopping push")
@@ -1082,15 +1235,21 @@ async def monitor_once(http, bf, okx_swap, spot_clients):
     elapsed = time.time() - t0
     parts = []
     for lv in ["🔴", "🟠", "🟡"]:
-        n = len(alerts_by_level[lv])
+        n = len(push_alerts_by_level[lv])
         if n > 0:
-            names = " ".join(a[0] for a in alerts_by_level[lv][:3])
-            lvl_change_marks = " ".join(a[3] for a in alerts_by_level[lv][:3] if a[3])
+            names = " ".join(a[0] for a in push_alerts_by_level[lv][:3])
+            lvl_change_marks = " ".join(a[3] for a in push_alerts_by_level[lv][:3] if a[3])
             parts.append(f"{lv}{n}({names}{' ' + lvl_change_marks if lvl_change_marks else ''})")
     alert_summary = " | ".join(parts) if parts else "无告警"
     ts3 = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts3}] 本轮结束 | 耗时 {elapsed:.0f}s | {alert_summary} | TG 推送 {total_alerts} 条")
-    logger.info(f"Round {round_count} done: {total_alerts} alerts, {elapsed:.1f}s")
+    print(
+        f"[{ts3}] 本轮结束 | 耗时 {elapsed:.0f}s | {alert_summary} | "
+        f"TG 推送 {total_pushed} 条, 仅记录 {log_only_count} 条"
+    )
+    logger.info(
+        f"Round {round_count} done: {total_pushed} pushed, "
+        f"{log_only_count} log-only, {elapsed:.1f}s"
+    )
 
 
 # ====================================================================
@@ -1143,7 +1302,11 @@ async def send_tg_summary(message, http):
 
 
 async def maybe_send_summary(http):
-    """Check if we've crossed a 6h boundary, if so send summary."""
+    """Check if we've crossed a 6h boundary, if so send summary.
+
+    Ranking: prioritize coins with diverse rule types (not just raw count).
+    Sort by: 1) distinct rule count desc, 2) max score desc, 3) push count desc.
+    """
     global last_summary_hour, summary_alerts
     now = datetime.now(timezone.utc)
     current_hour = now.hour
@@ -1166,35 +1329,62 @@ async def maybe_send_summary(http):
     else:
         # Count by level
         level_counts = {"🔴": 0, "🟠": 0, "🟡": 0}
-        symbol_hits: dict[str, list[str]] = {}
+        # Per-symbol aggregation
+        sym_data: dict[str, dict] = {}
         for alert in summary_alerts:
             lv = alert["level"]
             level_counts[lv] = level_counts.get(lv, 0) + 1
             sym = alert["symbol"]
-            if sym not in symbol_hits:
-                symbol_hits[sym] = []
+            if sym not in sym_data:
+                sym_data[sym] = {
+                    "distinct_rules": set(),
+                    "max_score": 0,
+                    "push_count": 0,
+                    "total_count": 0,
+                    "max_level": "🟡",
+                }
+            sd = sym_data[sym]
+            sd["total_count"] += 1
+            # Collect all distinct rule tags ever seen for this symbol
             for tag, _ in alert["hits"]:
-                if tag not in symbol_hits[sym]:
-                    symbol_hits[sym].append(tag)
+                sd["distinct_rules"].add(tag)
+            sd["max_score"] = max(sd["max_score"], alert.get("score", 0))
+            if alert.get("should_push"):
+                sd["push_count"] += 1
+            # Track highest level
+            if LEVEL_ORDER.get(lv, 0) > LEVEL_ORDER.get(sd["max_level"], 0):
+                sd["max_level"] = lv
 
-        # Top symbols by alert frequency
-        sym_freq = sorted(
-            [(sym, len([a for a in summary_alerts if a["symbol"] == sym]))
-             for sym in symbol_hits],
-            key=lambda x: -x[1]
+        # Sort: distinct rule count desc → max_score desc → push_count desc
+        ranked = sorted(
+            sym_data.items(),
+            key=lambda x: (
+                len(x[1]["distinct_rules"]),
+                x[1]["max_score"],
+                x[1]["push_count"],
+            ),
+            reverse=True,
         )
+
+        total_alerts = len(summary_alerts)
+        total_pushed = sum(1 for a in summary_alerts if a.get("should_push"))
 
         lines = [
             f"📋 <b>6h 数据总结</b> ({last_summary_hour:02d}:00 ~ {summary_boundary:02d}:00 UTC)",
             "━━━━━━━━━━━━━━━━━",
-            f"📊 告警总数: {len(summary_alerts)} 条",
+            f"📊 告警: {total_alerts} 条 (推送 {total_pushed}, 仅记录 {total_alerts - total_pushed})",
             f"   🔴 {level_counts['🔴']} | 🟠 {level_counts['🟠']} | 🟡 {level_counts['🟡']}",
             "",
-            "🏆 <b>高频触发币种 (Top 10)</b>",
+            "🏆 <b>高价值币种 (Top 10)</b>",
         ]
-        for sym, count in sym_freq[:10]:
-            rules = ", ".join(symbol_hits[sym])
-            lines.append(f"  • <b>{sym}</b> × {count} ({rules})")
+        for sym, sd in ranked[:10]:
+            rules_str = ", ".join(sorted(sd["distinct_rules"]))
+            push_str = f"{sd['push_count']}推" if sd["push_count"] > 0 else "无推送"
+            lines.append(
+                f"  • {sd['max_level']} <b>{sym}</b> "
+                f"| {rules_str} | {push_str}/{sd['total_count']}次 "
+                f"| ⚡{sd['max_score']}"
+            )
 
         lines.append("")
         lines.append(f"<i>{now.strftime('%Y-%m-%d %H:%M UTC')}</i>")
@@ -1209,7 +1399,7 @@ async def main():
     http = httpx.AsyncClient(
         timeout=httpx.Timeout(20, connect=10),
         limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
-        headers={"User-Agent": "PumpMonitor/3.0"},
+        headers={"User-Agent": "PumpMonitor/4.0"},
     )
 
     bf = BinanceFutures(http)
@@ -1237,14 +1427,17 @@ async def main():
             logger.error(f"{c.name} symbol load failed: {r}")
 
     warmup_min = CONFIG["netflow_window_count"] * CONFIG["loop_interval_seconds"] // 60
+    mem_window = CONFIG["scoring"]["memory_window_rounds"] * CONFIG["loop_interval_seconds"] // 60
     startup_msg = (
-        f"✅ 监控脚本已启动\n"
+        f"✅ 监控脚本 v4 已启动\n"
         f"• 币种池: Binance ∩ OKX 永续交集\n"
         f"• 现货 Netflow: 8 家聚合\n"
+        f"• 规则: R1-R5, 评分制 (≥2 规则才推送, 🔴 单条即推)\n"
+        f"• 信号记忆窗口: {mem_window} 分钟\n"
         f"• R4 需要预热 {warmup_min} 分钟后才开始触发"
     )
     await send_tg_alert(startup_msg, http)
-    print(f"Startup complete. R4 warmup: {warmup_min} min. Starting monitor loop...")
+    print(f"Startup complete. R4 warmup: {warmup_min} min, memory: {mem_window} min. Starting monitor loop...")
 
     try:
         while True:
