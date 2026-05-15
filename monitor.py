@@ -40,7 +40,7 @@ v4 改进:
     🔴 级别(R3): 单条即推送
     其余: 2h 窗口内 ≥2 条不同规则触发才推送,单条仅记日志
 
-R4 预热期: 启动后需 45~60 分钟累积 4 个 15min 窗口后才开始触发。
+R4 预热期: 启动后需 60 分钟累积 2 个 30min 窗口后才开始触发。
 
 日志: logs/monitor.log (日级轮转,保留 30 天)
     告警级别 WARNING(JSON 格式),可用 jq / pandas 查询。
@@ -65,7 +65,7 @@ load_dotenv()
 # ============ CONFIG ============
 CONFIG = {
     "loop_interval_seconds": 1800,
-    "netflow_window_count": 4,
+    "netflow_window_count": 2,
     "netflow_min_exchanges": 4,
     "scoring": {
         "memory_window_rounds": 8,          # 2h = 8 × 15min 信号记忆窗口
