@@ -121,7 +121,7 @@ round_count = 0
 # 6h summary accumulator: list of alert records per summary window
 summary_alerts: list[dict] = []
 last_summary_hour: int = -1
-# 2h signal memory: {symbol: deque of (round_number, frozenset_of_rule_tags)}
+# 2h signal memory: {symbol: deque of (round_number, frozenset_of_rule_tags, dict_of_reasons)}
 signal_memory: dict[str, deque] = defaultdict(
     lambda: deque(maxlen=CONFIG["scoring"]["memory_window_rounds"])
 )
@@ -904,13 +904,18 @@ def evaluate(base, data):
         current_round_tags.add("R5")
 
     # --- Signal memory: 2h sliding window ---
+    # Store reasons alongside tags for historical display
+    current_reasons = {tag: reason for tag, reason in hits}
     if current_round_tags:
-        signal_memory[base].append((round_count, frozenset(current_round_tags)))
+        signal_memory[base].append((round_count, frozenset(current_round_tags), current_reasons))
 
-    # Compute recent_rules: union of all rule tags in the memory window
+    # Compute recent_rules + collect all historical reasons
     recent_rules = set()
-    for _rnd, tags in signal_memory[base]:
+    recent_reasons: dict[str, str] = {}  # tag → reason (latest reason wins)
+    for _rnd, tags, reasons in signal_memory[base]:
         recent_rules.update(tags)
+        for tag, reason in reasons.items():
+            recent_reasons[tag] = reason  # overwrite with newer reason
 
     # --- Scoring ---
     scoring_cfg = CONFIG["scoring"]
@@ -954,6 +959,7 @@ def evaluate(base, data):
         "total_1h_netflow": total_1h_nf,
         "score": round(score, 1),
         "recent_rules": sorted(recent_rules),
+        "recent_reasons": recent_reasons,
         "current_round_hits": sorted(current_round_tags),
         "should_push": should_push,
     }
@@ -1024,11 +1030,16 @@ def format_tg_message(base, result, data, level_change):
         lines.append(f"📡 2h 内触发: {recent_str} (本轮: {current_str})")
     lines.append("")
 
-    # Rules hit
-    if result["hits"]:
+    # Rules hit (show all recent rules, mark historical ones)
+    recent_reasons = result.get("recent_reasons", {})
+    if recent_reasons:
         lines.append("🎯 <b>命中规则</b>")
-        for tag, reason in result["hits"]:
-            lines.append(f"- {tag}: {reason}")
+        for tag in sorted(recent_reasons.keys()):
+            reason = recent_reasons[tag]
+            if tag in current_hits:
+                lines.append(f"- {tag}: {reason}")
+            else:
+                lines.append(f"- {tag}: {reason} <i>(前轮)</i>")
         lines.append("")
 
     # OI (from R1 or R5)
