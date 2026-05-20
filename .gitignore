@@ -6,3 +6,5 @@ __pycache__/
 .claude/
 .venv/
 proxy/
+dolphin/state.json
+dolphin/logs/
