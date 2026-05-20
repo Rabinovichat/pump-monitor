@@ -92,14 +92,14 @@ STATE_FILE = SCRIPT_DIR / "state.json"
 
 
 # ============ Global State (loaded from file) ============
-netflow_history: dict[str, dict[str, deque]] = defaultdict(
+netflow_history = defaultdict(
     lambda: defaultdict(lambda: deque(maxlen=CONFIG["netflow_window_count"]))
 )
-last_levels: dict[str, str] = {}
+last_levels = {}
 round_count = 0
-summary_alerts: list[dict] = []
-last_summary_hour: int = -1
-signal_memory: dict[str, deque] = defaultdict(
+summary_alerts = []
+last_summary_hour = -1
+signal_memory = defaultdict(
     lambda: deque(maxlen=CONFIG["scoring"]["memory_window_rounds"])
 )
 
@@ -222,7 +222,7 @@ def evaluate(base, data):
         signal_memory[base].append((round_count, frozenset(current_round_tags), current_reasons))
 
     recent_rules = set()
-    recent_reasons: dict[str, str] = {}
+    recent_reasons = {}
     for _rnd, tags, reasons in signal_memory[base]:
         recent_rules.update(tags)
         for tag, reason in reasons.items():
@@ -292,7 +292,7 @@ async def maybe_send_summary(http):
         )
     else:
         level_counts = {"🔴": 0, "🟠": 0, "🟡": 0}
-        sym_data: dict[str, dict] = {}
+        sym_data = {}
         for alert in summary_alerts:
             lv = alert["level"]
             level_counts[lv] = level_counts.get(lv, 0) + 1

@@ -113,16 +113,16 @@ logger.add(
 )
 
 # ============ Global State ============
-netflow_history: dict[str, dict[str, deque]] = defaultdict(
+netflow_history = defaultdict(
     lambda: defaultdict(lambda: deque(maxlen=CONFIG["netflow_window_count"]))
 )
-last_levels: dict[str, str] = {}
+last_levels = {}
 round_count = 0
 # 6h summary accumulator: list of alert records per summary window
-summary_alerts: list[dict] = []
-last_summary_hour: int = -1
+summary_alerts = []
+last_summary_hour = -1
 # 2h signal memory: {symbol: deque of (round_number, frozenset_of_rule_tags, dict_of_reasons)}
-signal_memory: dict[str, deque] = defaultdict(
+signal_memory = defaultdict(
     lambda: deque(maxlen=CONFIG["scoring"]["memory_window_rounds"])
 )
 
@@ -911,7 +911,7 @@ def evaluate(base, data):
 
     # Compute recent_rules + collect all historical reasons
     recent_rules = set()
-    recent_reasons: dict[str, str] = {}  # tag → reason (latest reason wins)
+    recent_reasons = {}  # tag → reason (latest reason wins)
     for _rnd, tags, reasons in signal_memory[base]:
         recent_rules.update(tags)
         for tag, reason in reasons.items():
@@ -1341,7 +1341,7 @@ async def maybe_send_summary(http):
         # Count by level
         level_counts = {"🔴": 0, "🟠": 0, "🟡": 0}
         # Per-symbol aggregation
-        sym_data: dict[str, dict] = {}
+        sym_data = {}
         for alert in summary_alerts:
             lv = alert["level"]
             level_counts[lv] = level_counts.get(lv, 0) + 1
