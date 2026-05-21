@@ -1400,7 +1400,7 @@ async def maybe_send_summary(http):
             if sym not in sym_data:
                 sym_data[sym] = {
                     "distinct_rules": set(),
-                    "max_score": 0,
+                    "total_score": 0,
                     "push_count": 0,
                     "total_count": 0,
                     "max_level": "🟡",
@@ -1410,19 +1410,19 @@ async def maybe_send_summary(http):
             # Collect all distinct rule tags ever seen for this symbol
             for tag, _ in alert["hits"]:
                 sd["distinct_rules"].add(tag)
-            sd["max_score"] = max(sd["max_score"], alert.get("score", 0))
+            sd["total_score"] += alert.get("score", 0)
             if alert.get("should_push"):
                 sd["push_count"] += 1
             # Track highest level
             if LEVEL_ORDER.get(lv, 0) > LEVEL_ORDER.get(sd["max_level"], 0):
                 sd["max_level"] = lv
 
-        # Sort: distinct rule count desc → max_score desc → push_count desc
+        # Sort: distinct rule count desc → total_score desc → push_count desc
         ranked = sorted(
             sym_data.items(),
             key=lambda x: (
                 len(x[1]["distinct_rules"]),
-                x[1]["max_score"],
+                x[1]["total_score"],
                 x[1]["push_count"],
             ),
             reverse=True,
@@ -1445,7 +1445,7 @@ async def maybe_send_summary(http):
             lines.append(
                 f"  • {sd['max_level']} <b>{sym}</b> "
                 f"| {rules_str} | {push_str}/{sd['total_count']}次 "
-                f"| ⚡{sd['max_score']}"
+                f"| ⚡{round(sd['total_score'], 1)}"
             )
 
         lines.append("")
