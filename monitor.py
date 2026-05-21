@@ -100,6 +100,9 @@ TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TG_SUMMARY_TOKEN = os.getenv("TELEGRAM_SUMMARY_BOT_TOKEN", "")
 TG_SUMMARY_CHAT_ID = os.getenv("TELEGRAM_SUMMARY_CHAT_ID", "")
 
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+SLACK_SUMMARY_WEBHOOK_URL = os.getenv("SLACK_SUMMARY_WEBHOOK_URL", "") or SLACK_WEBHOOK_URL
+
 # ============ Logging ============
 logger.remove()
 logger.add(
@@ -1230,7 +1233,7 @@ async def monitor_once(http, bf, okx_swap, spot_clients):
         push_alerts_by_level[level].sort(key=lambda x: x[1]["score"], reverse=True)
         for base, result, data, level_change in push_alerts_by_level[level]:
             msg = format_tg_message(base, result, data, level_change)
-            await send_tg_alert(msg, http)
+            await send_slack_alert(msg, http)
             total_pushed += 1
             if total_pushed < 20:
                 await asyncio.sleep(3.5)
@@ -1308,6 +1311,55 @@ async def send_tg_summary(message, http):
             logger.warning(f"Summary TG push error (attempt {attempt + 1}): {e}")
         await asyncio.sleep(2 ** attempt)
     logger.error("Summary TG push final failure")
+    return False
+
+
+def _tg_to_slack(message):
+    """Convert TG HTML format to Slack mrkdwn format."""
+    import re
+    text = message
+    text = re.sub(r'<b>(.*?)</b>', r'*\1*', text)
+    text = re.sub(r'<i>(.*?)</i>', r'_\1_', text)
+    text = re.sub(r'<code>(.*?)</code>', r'`\1`', text)
+    text = re.sub(r'<[^>]+>', '', text)  # strip remaining HTML tags
+    return text
+
+
+async def send_slack_alert(message, http):
+    """Send alert to Slack via Incoming Webhook."""
+    if not SLACK_WEBHOOK_URL:
+        logger.warning("Slack webhook not configured, skip push")
+        return False
+    text = _tg_to_slack(message)
+    for attempt in range(3):
+        try:
+            r = await http.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=10)
+            if r.status_code == 200:
+                return True
+            logger.warning(f"Slack push HTTP {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            logger.warning(f"Slack push error (attempt {attempt + 1}): {e}")
+        await asyncio.sleep(2 ** attempt)
+    logger.error("Slack push final failure")
+    return False
+
+
+async def send_slack_summary(message, http):
+    """Send summary to Slack via Incoming Webhook."""
+    if not SLACK_SUMMARY_WEBHOOK_URL:
+        logger.warning("Slack summary webhook not configured, skip")
+        return False
+    text = _tg_to_slack(message)
+    for attempt in range(3):
+        try:
+            r = await http.post(SLACK_SUMMARY_WEBHOOK_URL, json={"text": text}, timeout=10)
+            if r.status_code == 200:
+                return True
+            logger.warning(f"Slack summary push HTTP {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            logger.warning(f"Slack summary push error (attempt {attempt + 1}): {e}")
+        await asyncio.sleep(2 ** attempt)
+    logger.error("Slack summary push final failure")
     return False
 
 
@@ -1400,7 +1452,7 @@ async def maybe_send_summary(http):
         lines.append(f"<i>{now.strftime('%Y-%m-%d %H:%M UTC')}</i>")
         msg = "\n".join(lines)
 
-    await send_tg_summary(msg, http)
+    await send_slack_summary(msg, http)
     last_summary_hour = summary_boundary
     summary_alerts.clear()
 
@@ -1446,7 +1498,7 @@ async def main():
         f"• 信号记忆窗口: {mem_window} 分钟\n"
         f"• R4 需要预热 {warmup_min} 分钟后才开始触发"
     )
-    await send_tg_alert(startup_msg, http)
+    await send_slack_alert(startup_msg, http)
     print(f"Startup complete. R4 warmup: {warmup_min} min, memory: {mem_window} min. Starting monitor loop...")
 
     try:
@@ -1465,7 +1517,7 @@ async def main():
         pass
     finally:
         try:
-            await send_tg_alert("🛑 监控脚本已手动停止", http)
+            await send_slack_alert("🛑 监控脚本已手动停止", http)
         except Exception:
             pass
         await http.aclose()

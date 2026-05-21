@@ -73,6 +73,9 @@ TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TG_SUMMARY_TOKEN = os.getenv("TELEGRAM_SUMMARY_BOT_TOKEN", "")
 TG_SUMMARY_CHAT_ID = os.getenv("TELEGRAM_SUMMARY_CHAT_ID", "")
 
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+SLACK_SUMMARY_WEBHOOK_URL = os.getenv("SLACK_SUMMARY_WEBHOOK_URL", "") or SLACK_WEBHOOK_URL
+
 # ============ Logging ============
 logger.remove()
 logger.add(
@@ -174,8 +177,9 @@ from monitor import (
     HtxSpot, GateSpot, MexcSpot, KucoinSpot,
     get_universe, update_netflow_history, fetch_symbol_data,
     rule_r1, rule_r2, rule_r3, rule_r4, rule_r5,
-    detect_level_change, format_tg_message, send_tg_alert,
-    send_tg_summary, log_alert_json, _fmt_usd,
+    detect_level_change, format_tg_message,
+    send_slack_alert, send_slack_summary,
+    log_alert_json, _fmt_usd,
     LEVEL_ORDER, LEVEL_LABELS,
 )
 
@@ -348,7 +352,7 @@ async def maybe_send_summary(http):
         lines.append(f"<i>{now.strftime('%Y-%m-%d %H:%M UTC')}</i>")
         msg = "\n".join(lines)
 
-    await send_tg_summary(msg, http)
+    await send_slack_summary(msg, http)
     last_summary_hour = summary_boundary
     summary_alerts.clear()
 
@@ -446,7 +450,7 @@ async def run_once():
             push_alerts_by_level[level].sort(key=lambda x: x[1]["score"], reverse=True)
             for base, result, data, level_change in push_alerts_by_level[level]:
                 msg = format_tg_message(base, result, data, level_change)
-                await send_tg_alert(msg, http)
+                await send_slack_alert(msg, http)
                 total_pushed += 1
                 if total_pushed < 20:
                     await asyncio.sleep(3.5)
