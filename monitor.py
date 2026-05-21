@@ -814,7 +814,7 @@ def rule_r3(d):
 
 
 def rule_r4(base):
-    """现货净流异常: 8 家聚合 1h |netflow| >= threshold"""
+    """现货净流出异常: 8 家聚合 1h 净流出 >= threshold (拉升前的吸筹信号)"""
     threshold = CONFIG["rules"]["r4_netflow_threshold_usd"]
     min_ex = CONFIG["netflow_min_exchanges"]
     per_exchange_1h = {}
@@ -825,9 +825,8 @@ def rule_r4(base):
     if len(per_exchange_1h) < min_ex:
         return False, f"数据不足({len(per_exchange_1h)}/{min_ex}家)", per_exchange_1h
     total_1h = sum(per_exchange_1h.values())
-    if abs(total_1h) >= threshold:
-        direction = "净流入" if total_1h > 0 else "净流出"
-        reason = f"8家聚合{direction} ${abs(total_1h):,.0f}"
+    if total_1h <= -threshold:
+        reason = f"8家聚合净流出 ${abs(total_1h):,.0f}"
         return True, reason, per_exchange_1h
     return False, "", per_exchange_1h
 
