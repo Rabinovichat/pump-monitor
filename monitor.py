@@ -29,9 +29,8 @@ v4 改进:
 启动:
     python monitor.py
 
-五条规则:
+四条规则:
     R1 OI 异常增长       1h OI 增长率 >= 3x 价格涨幅           🟠 预警
-    R2 资金费率持续负     过去 24h(3期) 所有结算均 < 0          🟠 预警
     R3 资金费率极值       当前资金费率 <= -0.05%                🔴 行动
     R4 现货净流异常       8 家聚合 1h 净流入/出 >= $500,000     🟡 关注
     R5 OI增长+正费率     OI 异常增长且正费率 >= +0.05%         🟠 预警
@@ -72,7 +71,7 @@ CONFIG = {
         "push_min_rules": 2,                # ≥2 条不同规则才推送 TG
         "push_override_levels": {"🔴"},     # 🔴 级别单条也推送
         "rule_base_scores": {
-            "R1": 3, "R2": 2, "R3": 5, "R4": 2, "R5": 3,
+            "R1": 3, "R3": 5, "R4": 2, "R5": 3,
         },
         "multi_rule_multiplier": 1.5,       # 每多一条规则 score ×1.5
     },
@@ -81,7 +80,6 @@ CONFIG = {
         "r1_oi_growth_min_pct": 0.033,         # OI 增长率不低于 3.3%
         "r1_oi_growth_min_usd": 50_000,         # OI 绝对增长不低于 $50k
         "r1_oi_growth_zero_price_usd": 150_000, # 价格不变时 OI 增长 >= $150k
-        "r2_negative_funding_periods": 3,
         "r3_funding_rate_threshold": -0.0005,
         "r4_netflow_threshold_usd": 500_000,
         "r5_oi_growth_min_pct": 0.033,         # R5: OI 增长率门槛 (同 R1)
@@ -787,20 +785,6 @@ def rule_r1(d):
     return triggered, reason, extra
 
 
-def rule_r2(d):
-    """资金费率持续为负: 过去 3 期 (24h) 全部 < 0"""
-    n = CONFIG["rules"]["r2_negative_funding_periods"]
-    sources = []
-    if len(d["bn_fr_hist"]) >= n and all(fr < 0 for fr in d["bn_fr_hist"][:n]):
-        sources.append("Binance")
-    if len(d["ok_fr_hist"]) >= n and all(fr < 0 for fr in d["ok_fr_hist"][:n]):
-        sources.append("OKX")
-    if not sources:
-        return False, "", {}
-    reason = f"过去 {n} 期资金费率全负 ({', '.join(sources)})"
-    return True, reason, {"sources": sources}
-
-
 def rule_r3(d):
     """资金费率极值: 当前 FR <= threshold"""
     threshold = CONFIG["rules"]["r3_funding_rate_threshold"]
@@ -881,7 +865,6 @@ def rule_r5(d):
 
 def evaluate(base, data):
     r1_hit, r1_reason, r1_extra = rule_r1(data)
-    r2_hit, r2_reason, r2_extra = rule_r2(data)
     r3_hit, r3_reason, r3_extra = rule_r3(data)
     r4_hit, r4_reason, r4_extra = rule_r4(base)
     r5_hit, r5_reason, r5_extra = rule_r5(data)
@@ -895,9 +878,6 @@ def evaluate(base, data):
     if r1_hit:
         hits.append(("R1", r1_reason))
         current_round_tags.add("R1")
-    if r2_hit:
-        hits.append(("R2", r2_reason))
-        current_round_tags.add("R2")
     if r4_hit:
         hits.append(("R4", r4_reason))
         current_round_tags.add("R4")
@@ -931,7 +911,7 @@ def evaluate(base, data):
         level = "🟢"
     elif "R3" in recent_rules:
         level = "🔴"
-    elif recent_rules & {"R1", "R2", "R5"}:
+    elif recent_rules & {"R1", "R5"}:
         level = "🟠"
     else:
         level = "🟡"

@@ -45,7 +45,7 @@ CONFIG = {
         "push_min_rules": 2,
         "push_override_levels": {"🔴"},
         "rule_base_scores": {
-            "R1": 3, "R2": 2, "R3": 5, "R4": 2, "R5": 3,
+            "R1": 3, "R3": 5, "R4": 2, "R5": 3,
         },
         "multi_rule_multiplier": 1.5,
     },
@@ -54,7 +54,6 @@ CONFIG = {
         "r1_oi_growth_min_pct": 0.033,
         "r1_oi_growth_min_usd": 50_000,
         "r1_oi_growth_zero_price_usd": 150_000,
-        "r2_negative_funding_periods": 3,
         "r3_funding_rate_threshold": -0.0005,
         "r4_netflow_threshold_usd": 500_000,
         "r5_oi_growth_min_pct": 0.033,
@@ -176,7 +175,7 @@ from monitor import (
     BinanceSpot, OkxSpot, BybitSpot, BitgetSpot,
     HtxSpot, GateSpot, MexcSpot, KucoinSpot,
     get_universe, update_netflow_history, fetch_symbol_data,
-    rule_r1, rule_r2, rule_r3, rule_r4, rule_r5,
+    rule_r1, rule_r3, rule_r4, rule_r5,
     detect_level_change, format_tg_message,
     send_slack_alert, send_slack_summary,
     log_alert_json, _fmt_usd,
@@ -198,7 +197,6 @@ monitor.last_summary_hour = last_summary_hour
 def evaluate(base, data):
     global round_count
     r1_hit, r1_reason, r1_extra = rule_r1(data)
-    r2_hit, r2_reason, r2_extra = rule_r2(data)
     r3_hit, r3_reason, r3_extra = rule_r3(data)
     r4_hit, r4_reason, r4_extra = rule_r4(base)
     r5_hit, r5_reason, r5_extra = rule_r5(data)
@@ -211,9 +209,6 @@ def evaluate(base, data):
     if r1_hit:
         hits.append(("R1", r1_reason))
         current_round_tags.add("R1")
-    if r2_hit:
-        hits.append(("R2", r2_reason))
-        current_round_tags.add("R2")
     if r4_hit:
         hits.append(("R4", r4_reason))
         current_round_tags.add("R4")
@@ -242,7 +237,7 @@ def evaluate(base, data):
         level = "🟢"
     elif "R3" in recent_rules:
         level = "🔴"
-    elif recent_rules & {"R1", "R2", "R5"}:
+    elif recent_rules & {"R1", "R5"}:
         level = "🟠"
     else:
         level = "🟡"
