@@ -149,7 +149,27 @@ def load_state():
         last_summary_hour = raw.get("last_summary_hour", -1)
         last_levels.update(raw.get("last_levels", {}))
         last_push_round.update(raw.get("last_push_round", {}))
-        summary_alerts.extend(raw.get("summary_alerts", []))
+
+        # 当前生效的规则集 (唯一真源: rule_base_scores 的键). 用于过滤旧状态里
+        # 已下线规则的残留标签 —— 否则如 R2 这类已删规则会通过 signal_memory
+        # "复活", 出现在消息的 recent_rules 里并虚高 multi_rule_multiplier.
+        active_rules = set(CONFIG["scoring"]["rule_base_scores"])
+        dropped_tags = set()
+
+        # Restore summary_alerts (过滤已下线规则)
+        for a in raw.get("summary_alerts", []):
+            hits = [h for h in a.get("hits", []) if h and h[0] in active_rules]
+            dropped_tags.update(
+                h[0] for h in a.get("hits", []) if h and h[0] not in active_rules
+            )
+            if not hits:
+                continue          # 整条都是已下线规则 → 丢弃
+            a["hits"] = hits
+            a["recent_rules"] = [t for t in a.get("recent_rules", []) if t in active_rules]
+            a["current_round_hits"] = [
+                t for t in a.get("current_round_hits", []) if t in active_rules
+            ]
+            summary_alerts.append(a)
 
         # Restore netflow_history
         for sym, exchanges in raw.get("netflow_history", {}).items():
@@ -158,17 +178,30 @@ def load_state():
                 for v in values:
                     dq.append(v)
 
-        # Restore signal_memory
+        # Restore signal_memory (过滤已下线规则)
         for sym, entries in raw.get("signal_memory", {}).items():
             dq = signal_memory[sym]
             for rnd, tags, reasons in entries:
-                dq.append((rnd, frozenset(tags), reasons))
+                keep = [t for t in tags if t in active_rules]
+                dropped_tags.update(set(tags) - active_rules)
+                if not keep:
+                    continue      # 该轮只命中已下线规则 → 丢弃这条记忆
+                dq.append((
+                    rnd,
+                    frozenset(keep),
+                    {t: r for t, r in reasons.items() if t in active_rules},
+                ))
 
         logger.info(
             f"State loaded: round={round_count}, "
             f"symbols={len(signal_memory)}, "
             f"netflow_symbols={len(netflow_history)}"
         )
+        if dropped_tags:
+            logger.warning(
+                f"已从旧状态中清除下线规则的残留标签: {sorted(dropped_tags)} "
+                f"(当前生效规则: {sorted(active_rules)})"
+            )
     except Exception as e:
         logger.error(f"Failed to load state: {e}, starting fresh")
 
