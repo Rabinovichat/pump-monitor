@@ -11,3 +11,6 @@ dolphin/state.json
 dolphin/logs/
 .playwright-mcp/
 *.png
+
+# 特征分析缓存
+.cache_feature.json
