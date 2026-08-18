@@ -66,6 +66,7 @@ CONFIG = {
     "loop_interval_seconds": 1800,
     "netflow_window_count": 2,
     "netflow_min_exchanges": 4,
+    "push_cooldown_hours": 4,               # 同一币种推送后 N 小时内不再重复推送(仅记录)
     "scoring": {
         "memory_window_rounds": 8,          # 2h = 8 × 15min 信号记忆窗口
         "push_min_rules": 2,                # ≥2 条不同规则才推送 TG
@@ -119,6 +120,8 @@ netflow_history = defaultdict(
 )
 last_levels = {}
 round_count = 0
+# Push cooldown: {symbol: round_number of last actual push}
+last_push_round = {}
 # 6h summary accumulator: list of alert records per summary window
 summary_alerts = []
 last_summary_hour = -1
@@ -926,6 +929,17 @@ def evaluate(base, data):
         elif len(recent_rules) >= scoring_cfg["push_min_rules"]:
             should_push = True       # multi-rule fusion → push
 
+    # --- Push cooldown: 同一币种推送后一段时间内不再重复推送(降级为仅记录) ---
+    # round-based, so it persists across monitor_once.py 的多次调度 (round_count 持久化)
+    if should_push:
+        cooldown_rounds = max(
+            1,
+            round(CONFIG["push_cooldown_hours"] * 3600 / CONFIG["loop_interval_seconds"]),
+        )
+        last_pr = last_push_round.get(base)
+        if last_pr is not None and (round_count - last_pr) < cooldown_rounds:
+            should_push = False      # 冷却窗口内 → 仅记录, 不重复推送
+
     # Compute netflow total for display
     total_1h_nf = sum(
         sum(w) for w in netflow_history[base].values()
@@ -1214,6 +1228,7 @@ async def monitor_once(http, bf, okx_swap, spot_clients):
         for base, result, data, level_change in push_alerts_by_level[level]:
             msg = format_tg_message(base, result, data, level_change)
             await send_slack_alert(msg, http)
+            last_push_round[base] = round_count   # 记录推送轮次, 用于冷却
             total_pushed += 1
             if total_pushed < 20:
                 await asyncio.sleep(3.5)

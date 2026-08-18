@@ -40,6 +40,7 @@ CONFIG = {
     "loop_interval_seconds": 1800,
     "netflow_window_count": 2,
     "netflow_min_exchanges": 4,
+    "push_cooldown_hours": 4,               # 同一币种推送后 N 小时内不再重复推送(仅记录)
     "scoring": {
         "memory_window_rounds": 8,
         "push_min_rules": 2,
@@ -99,6 +100,7 @@ netflow_history = defaultdict(
 )
 last_levels = {}
 round_count = 0
+last_push_round = {}   # {symbol: round_number of last actual push}, 用于推送冷却
 summary_alerts = []
 last_summary_hour = -1
 signal_memory = defaultdict(
@@ -115,6 +117,7 @@ def save_state():
         "round_count": round_count,
         "last_summary_hour": last_summary_hour,
         "last_levels": last_levels,
+        "last_push_round": last_push_round,
         "summary_alerts": summary_alerts,
         "netflow_history": {
             sym: {ex: list(dq) for ex, dq in exchanges.items()}
@@ -142,6 +145,7 @@ def load_state():
         round_count = raw.get("round_count", 0)
         last_summary_hour = raw.get("last_summary_hour", -1)
         last_levels.update(raw.get("last_levels", {}))
+        last_push_round.update(raw.get("last_push_round", {}))
         summary_alerts.extend(raw.get("summary_alerts", []))
 
         # Restore netflow_history
@@ -248,6 +252,17 @@ def evaluate(base, data):
             should_push = True
         elif len(recent_rules) >= scoring_cfg["push_min_rules"]:
             should_push = True
+
+    # --- Push cooldown: 同一币种推送后一段时间内不再重复推送(降级为仅记录) ---
+    # round-based, round_count 跨调度持久化, 冷却窗口自然跨越多次运行
+    if should_push:
+        cooldown_rounds = max(
+            1,
+            round(CONFIG["push_cooldown_hours"] * 3600 / CONFIG["loop_interval_seconds"]),
+        )
+        last_pr = last_push_round.get(base)
+        if last_pr is not None and (round_count - last_pr) < cooldown_rounds:
+            should_push = False
 
     total_1h_nf = sum(
         sum(w) for w in netflow_history[base].values()
@@ -446,6 +461,7 @@ async def run_once():
             for base, result, data, level_change in push_alerts_by_level[level]:
                 msg = format_tg_message(base, result, data, level_change)
                 await send_slack_alert(msg, http)
+                last_push_round[base] = round_count   # 记录推送轮次, 用于冷却
                 total_pushed += 1
                 if total_pushed < 20:
                     await asyncio.sleep(3.5)
