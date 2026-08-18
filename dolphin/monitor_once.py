@@ -40,10 +40,12 @@ CONFIG = {
     "loop_interval_seconds": 1800,
     "netflow_window_count": 2,
     "netflow_min_exchanges": 4,
-    "push_cooldown_hours": 48,              # 同一币种推送后 N 小时内不再重复推送(仅记录). 与48h持仓周期对齐
+    "push_cooldown_hours": 24,              # 同一币种推送后 N 小时内不再重复推送(仅记录). 与24h持仓周期对齐
     "scoring": {
-        "memory_window_rounds": 8,
+        "memory_window_rounds": 8,          # 信号记忆窗口 = 8 轮 × loop_interval(30min) = 4h
         # 只推「本轮同时命中这些规则」的信号 = 回测验证过的可手操口径(R1+R3 空头拥挤).
+        # 30天样本(24h去重): 108信号(3.6个/天), 做空持仓24h → 净 +2.45%/笔, 胜率 67%.
+        # 持仓时长已回测: 24~32h 是平台期, 48h 明显偏长 —— 资金费按 ~-0.75%/天 线性累积.
         # 设为 None/[] 则回退下面的通用融合逻辑.
         "push_require_same_round": ["R1", "R3"],
         "push_min_rules": 2,

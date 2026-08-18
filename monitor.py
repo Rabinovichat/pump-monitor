@@ -7,7 +7,7 @@
 
 v4 改进:
     - 评分机制: 多规则联合触发的信号才推送 TG,单规则仅记日志,大幅降低噪音
-    - 2h 信号记忆窗口: 不同轮次触发的规则会被关联,形成综合评分
+    - 4h 信号记忆窗口(8 轮 × 30min): 不同轮次触发的规则会被关联,形成综合评分
     - 新增 R5: OI 增长 + 正费率 (≥+0.05%) = 多头主导拉升信号
     - 6h 总结按规则多样性排序,而非简单计数
 
@@ -35,9 +35,16 @@ v4 改进:
     R4 现货净流异常       8 家聚合 1h 净流入/出 >= $500,000     🟡 关注
     R5 OI增长+正费率     OI 异常增长且正费率 >= +0.05%         🟠 预警
 
-推送规则:
-    🔴 级别(R3): 单条即推送
-    其余: 2h 窗口内 ≥2 条不同规则触发才推送,单条仅记日志
+推送规则(已按回测收窄):
+    只推「本轮同时命中 R1+R3」的信号 —— 唯一经样本外验证的可手操口径。
+    R4/R5 仍照常计算并记日志(研究数据不断档),但不再推送。
+    同一币种推送后 24h 内不重复推送(与 24h 持仓周期对齐),期间降级为仅记录。
+    回退逻辑(push_require_same_round 置空时生效): 🔴 单条即推,其余 ≥2 条规则才推。
+
+对应交易口径(30天回测,含资金费与手续费,未含滑点):
+    方向做空,持仓 24h 后平仓,不设止损止盈,等权开仓。
+    净 +2.45%/笔,胜率 67%,平均并发约 3.6 仓。
+    注意: 持仓超过 24h 会被资金费(~-0.75%/天)反噬,48h 在样本外几乎打平。
 
 R4 预热期: 启动后需 60 分钟累积 2 个 30min 窗口后才开始触发。
 
@@ -66,11 +73,14 @@ CONFIG = {
     "loop_interval_seconds": 1800,
     "netflow_window_count": 2,
     "netflow_min_exchanges": 4,
-    "push_cooldown_hours": 48,              # 同一币种推送后 N 小时内不再重复推送(仅记录). 与48h持仓周期对齐
+    "push_cooldown_hours": 24,              # 同一币种推送后 N 小时内不再重复推送(仅记录). 与24h持仓周期对齐
     "scoring": {
-        "memory_window_rounds": 8,          # 2h = 8 × 15min 信号记忆窗口
+        "memory_window_rounds": 8,          # 信号记忆窗口 = 8 轮 × loop_interval(30min) = 4h
         # 只推「本轮同时命中这些规则」的信号 = 回测验证过的可手操口径(R1+R3 空头拥挤).
-        # 30天样本: 91信号(3个/天), 做空48h 胜率~65%. 设为 None/[] 则回退下面的通用融合逻辑.
+        # 30天样本(24h去重): 108信号(3.6个/天), 做空持仓24h → 净 +2.45%/笔, 胜率 67%.
+        # 持仓时长已回测: 24~32h 是平台期, 48h 明显偏长(样本外几乎打平) —— 价格收益在
+        # 24h 后基本走平, 而做空负费率币的资金费按 ~-0.75%/天 线性累积, 持越久越亏.
+        # 设为 None/[] 则回退下面的通用融合逻辑.
         "push_require_same_round": ["R1", "R3"],
         "push_min_rules": 2,                # (回退逻辑) ≥2 条不同规则才推送
         "push_override_levels": {"🔴"},     # (回退逻辑) 🔴 级别单条也推送
@@ -128,7 +138,7 @@ last_push_round = {}
 # 6h summary accumulator: list of alert records per summary window
 summary_alerts = []
 last_summary_hour = -1
-# 2h signal memory: {symbol: deque of (round_number, frozenset_of_rule_tags, dict_of_reasons)}
+# 4h signal memory (8 rounds × 30min): {symbol: deque of (round_number, frozenset_of_rule_tags, dict_of_reasons)}
 signal_memory = defaultdict(
     lambda: deque(maxlen=CONFIG["scoring"]["memory_window_rounds"])
 )
@@ -891,7 +901,7 @@ def evaluate(base, data):
         hits.append(("R5", r5_reason))
         current_round_tags.add("R5")
 
-    # --- Signal memory: 2h sliding window ---
+    # --- Signal memory: 4h sliding window (memory_window_rounds × loop_interval) ---
     # Store reasons alongside tags for historical display
     current_reasons = {tag: reason for tag, reason in hits}
     if current_round_tags:
@@ -1000,7 +1010,9 @@ def _fmt_usd(val):
     if abs_v >= 1e9:
         return f"{sign}${abs_v / 1e9:.1f}B"
     if abs_v >= 1e6:
-        return f"{sign}${abs_v / 1e6:.0f}M"
+        # 2 位小数: 原来用 .0f, "OI 2.40M ← 2.29M" 会双双显示成 "$2M",
+        # OI 那一行等于什么都没说 —— 而增量恰恰是 R1 的全部意义所在.
+        return f"{sign}${abs_v / 1e6:.2f}M"
     if abs_v >= 1e3:
         return f"{sign}${abs_v / 1e3:.0f}k"
     return f"{sign}${abs_v:.0f}"
@@ -1010,7 +1022,6 @@ def format_tg_message(base, result, data, level_change):
     lv = result["level"]
     label = LEVEL_LABELS.get(lv, "信号")
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    score = result.get("score", 0)
     recent_rules = result.get("recent_rules", [])
     current_hits = result.get("current_round_hits", [])
 
@@ -1020,18 +1031,24 @@ def format_tg_message(base, result, data, level_change):
         pct = (data["price_now"] - data["price_1h"]) / data["price_1h"]
         price_pct = f"  1h: {pct:+.1%}"
 
-    # Header with score
+    # Header. 不再显示 score: 推送已收窄到 R1+R3, score 在这个池子里几乎是常量
+    # (实测 108 个信号 83% 取同一值, 与收益秩相关 -0.01), 摆在标题里只会误导仓位判断.
+    # score 仍保留在日志和 6h 总结里(那里包含未推送的 R4/R5, 仍有区分度).
     lines = [
-        f"{lv} <b>{label}</b> | <b>{base}</b> | ⚡{score}分",
+        f"{lv} <b>{label}</b> | <b>{base}</b>",
         "━━━━━━━━━━━━━━━━━",
         f"💰 现价: <code>{price_str}</code>{price_pct}",
     ]
 
-    # Signal fusion info
+    # Signal fusion info. 窗口长度从 CONFIG 推导, 避免写死后与配置不一致
+    # (此处原先硬编码 "2h", 但 8 轮 × 30min 实际是 4h, 长期在误导)
     if recent_rules:
+        mem_h = (CONFIG["scoring"]["memory_window_rounds"]
+                 * CONFIG["loop_interval_seconds"] / 3600)
+        win_str = f"{mem_h:.0f}h" if mem_h == int(mem_h) else f"{mem_h:.1f}h"
         recent_str = ", ".join(recent_rules)
         current_str = ", ".join(current_hits) if current_hits else "—"
-        lines.append(f"📡 2h 内触发: {recent_str} (本轮: {current_str})")
+        lines.append(f"📡 {win_str} 内触发: {recent_str} (本轮: {current_str})")
     lines.append("")
 
     # Rules hit (show all recent rules, mark historical ones)
