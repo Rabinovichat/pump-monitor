@@ -66,10 +66,27 @@ def sim_one(klines, entry, sl_pct, tp_pct, side="long"):
         return (entry - last) / entry  # 超时平仓(做空收益)
 
 
-async def run(cohort, log_file, side="long", cooldown=4):
-    records = parse_log_file(log_file)
+def slice_period(records, period):
+    """按时间跨度中点切分: first=前半(样本内), second=后半(样本外), all=全部."""
+    if period == "all" or not records:
+        return records
+    t0 = records[0]["ts_dt"]; t1 = records[-1]["ts_dt"]
+    mid = t0 + (t1 - t0) / 2
+    if period == "first":
+        return [r for r in records if r["ts_dt"] < mid]
+    if period == "second":
+        return [r for r in records if r["ts_dt"] >= mid]
+    raise ValueError(period)
+
+
+async def run(cohort, log_file, side="long", cooldown=4, period="all"):
+    records = slice_period(parse_log_file(log_file), period)
+    if records:
+        span = f"{records[0]['ts_dt']:%m-%d %H:%M} ~ {records[-1]['ts_dt']:%m-%d %H:%M}"
+    else:
+        span = "空"
     cands = [c for c in build_cohort(records, cohort, cooldown_hours=cooldown) if c.get("price_now")]
-    print(f"Cohort '{cohort}' 候选(有入场价): {len(cands)}  [方向={side}, 冷却={cooldown}h]")
+    print(f"Cohort '{cohort}' 候选(有入场价): {len(cands)}  [方向={side}, 冷却={cooldown}h, 时段={period}: {span}]")
 
     sem = asyncio.Semaphore(4)
     done = 0
@@ -150,9 +167,11 @@ def main():
                              "r1_r3_fused", "r1_r2_r3_fused", "score20", "score25"])
     ap.add_argument("--side", default="long", choices=["long", "short"])
     ap.add_argument("--cooldown", type=int, default=4, help="同币冷却小时数(去重). 设为48=每个持仓窗口只算首次播报")
+    ap.add_argument("--period", default="all", choices=["all", "first", "second"],
+                    help="时段切分: first=前半(样本内选参数), second=后半(样本外验证)")
     ap.add_argument("--log-file", default="logs/monitor_30d.log")
     args = ap.parse_args()
-    asyncio.run(run(args.cohort, args.log_file, args.side, args.cooldown))
+    asyncio.run(run(args.cohort, args.log_file, args.side, args.cooldown, args.period))
 
 
 if __name__ == "__main__":

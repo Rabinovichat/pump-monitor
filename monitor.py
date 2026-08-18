@@ -66,11 +66,14 @@ CONFIG = {
     "loop_interval_seconds": 1800,
     "netflow_window_count": 2,
     "netflow_min_exchanges": 4,
-    "push_cooldown_hours": 4,               # 同一币种推送后 N 小时内不再重复推送(仅记录)
+    "push_cooldown_hours": 48,              # 同一币种推送后 N 小时内不再重复推送(仅记录). 与48h持仓周期对齐
     "scoring": {
         "memory_window_rounds": 8,          # 2h = 8 × 15min 信号记忆窗口
-        "push_min_rules": 2,                # ≥2 条不同规则才推送 TG
-        "push_override_levels": {"🔴"},     # 🔴 级别单条也推送
+        # 只推「本轮同时命中这些规则」的信号 = 回测验证过的可手操口径(R1+R3 空头拥挤).
+        # 30天样本: 91信号(3个/天), 做空48h 胜率~65%. 设为 None/[] 则回退下面的通用融合逻辑.
+        "push_require_same_round": ["R1", "R3"],
+        "push_min_rules": 2,                # (回退逻辑) ≥2 条不同规则才推送
+        "push_override_levels": {"🔴"},     # (回退逻辑) 🔴 级别单条也推送
         "rule_base_scores": {
             "R1": 3, "R3": 5, "R4": 2, "R5": 3,
         },
@@ -924,7 +927,12 @@ def evaluate(base, data):
     # purely from memory when nothing new triggered this round)
     should_push = False
     if current_round_tags:
-        if level in scoring_cfg["push_override_levels"]:
+        require = scoring_cfg.get("push_require_same_round")
+        if require:
+            # 收窄口径: 只推本轮同时命中指定规则的信号(可手操策略入口).
+            # 注意用 current_round_tags 而非 recent_rules —— 必须同一轮共振, 回测中同扫描口径显著更强.
+            should_push = set(require) <= current_round_tags
+        elif level in scoring_cfg["push_override_levels"]:
             should_push = True       # 🔴 always pushes
         elif len(recent_rules) >= scoring_cfg["push_min_rules"]:
             should_push = True       # multi-rule fusion → push
@@ -1212,8 +1220,8 @@ async def monitor_once(http, bf, okx_swap, spot_clients):
                     else:
                         log_only_count += 1
                         logger.info(
-                            f"{base} 单规则触发 {result['current_round_hits']} "
-                            f"score={result['score']} → 仅记录"
+                            f"{base} 触发 {result['current_round_hits']} "
+                            f"score={result['score']} → 仅记录(未达推送口径/冷却中)"
                         )
             except Exception as e:
                 logger.exception(f"Processing {base} failed: {e}")
