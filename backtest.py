@@ -110,23 +110,36 @@ def find_candidates(records, quiet_hours, cooldown_hours):
 
 
 # ============ Price Fetching ============
+INTERVAL = "15m"          # 15分钟K线: 权重是1m的1/10, 一次请求覆盖48h, 不会被限流
+INTERVAL_MIN = 15
+
+
 async def fetch_klines(symbol, start_dt, end_dt, http):
-    """从 Binance Futures 拉 1 分钟 K 线."""
+    """从 Binance Futures 拉 K 线 (默认15m, 带 429/418 退避)."""
     url = "https://fapi.binance.com/fapi/v1/klines"
+    span_min = (end_dt - start_dt).total_seconds() / 60
+    limit = min(1500, int(span_min / INTERVAL_MIN) + 5)
     params = {
         "symbol": f"{symbol}USDT",
-        "interval": "1m",
+        "interval": INTERVAL,
         "startTime": int(start_dt.timestamp() * 1000),
         "endTime": int(end_dt.timestamp() * 1000),
-        "limit": 1500,
+        "limit": limit,
     }
-    try:
-        r = await http.get(url, params=params, timeout=15)
-        if r.status_code != 200:
-            return None
-        return r.json()
-    except Exception:
-        return None
+    for attempt in range(4):
+        try:
+            r = await http.get(url, params=params, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (418, 429):
+                # 被限流/封禁: 读 Retry-After 或指数退避
+                wait = int(r.headers.get("Retry-After", 2 ** attempt * 3))
+                await asyncio.sleep(min(wait, 30))
+                continue
+            return None  # 400 等 (币安无此合约) 直接放弃
+        except Exception:
+            await asyncio.sleep(1 + attempt)
+    return None
 
 
 # ============ Trade Simulation ============
@@ -299,32 +312,45 @@ async def run(cfg):
     if not candidates:
         return
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(20)) as http:
-        trades = []
-        for i, c in enumerate(candidates, 1):
-            entry_price = c.get("price_now")
-            if not entry_price:
-                print(f"  [{i}/{len(candidates)}] {c['symbol']} 缺少入场价, 跳过")
-                continue
+    # 只保留有入场价的候选
+    valid = [c for c in candidates if c.get("price_now")]
+    skipped_no_price = len(candidates) - len(valid)
+    if skipped_no_price:
+        print(f"跳过 {skipped_no_price} 条 (无 price_now)")
 
-            start_dt = c["ts_dt"]
-            end_dt = start_dt + timedelta(hours=cfg["max_hold_hours"])
+    # 并发拉取 K 线 (信号量限流, 避免币安 429). 拉取是纯 IO, 模拟是纯 CPU, 分两阶段.
+    concurrency = cfg.get("concurrency", 4)
+    sem = asyncio.Semaphore(concurrency)
+    done = 0
 
+    async def fetch_one(c, http):
+        nonlocal done
+        start_dt = c["ts_dt"]
+        end_dt = start_dt + timedelta(hours=cfg["max_hold_hours"])
+        async with sem:
             klines = await fetch_klines(c["symbol"], start_dt, end_dt, http)
-            if not klines:
-                print(f"  [{i}/{len(candidates)}] {c['symbol']} K线获取失败, 跳过")
-                await asyncio.sleep(0.2)
-                continue
+        done += 1
+        if done % 25 == 0 or done == len(valid):
+            print(f"  拉取进度 {done}/{len(valid)}", flush=True)
+        return c, klines
 
-            t = simulate_trade(klines, entry_price, cfg)
-            t["candidate"] = c
-            trades.append(t)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20)) as http:
+        print(f"并发拉取 K 线 (concurrency={concurrency})...", flush=True)
+        fetched = await asyncio.gather(*[fetch_one(c, http) for c in valid])
 
-            sign = "+" if t["pnl_pct"] >= 0 else ""
-            print(f"  [{i}/{len(candidates)}] {c['symbol']:8s} "
-                  f"@ {start_dt.strftime('%m-%d %H:%M')}  "
-                  f"{t['outcome']:22s} {sign}{t['pnl_pct']:.2%}")
-            await asyncio.sleep(0.15)  # 限速避免 429
+    # 模拟交易 (无网络)
+    trades = []
+    fail = 0
+    for c, klines in fetched:
+        if not klines:
+            fail += 1
+            continue
+        t = simulate_trade(klines, c["price_now"], cfg)
+        t["candidate"] = c
+        trades.append(t)
+    if fail:
+        print(f"K线获取失败 {fail} 条 (已跳过)")
+    print(f"成功模拟 {len(trades)} 笔交易")
 
     stats = aggregate_results(trades, cfg)
     if stats:

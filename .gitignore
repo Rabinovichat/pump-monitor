@@ -6,5 +6,8 @@ __pycache__/
 .claude/
 .venv/
 proxy/
+proxy
 dolphin/state.json
 dolphin/logs/
+.playwright-mcp/
+*.png
